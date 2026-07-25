@@ -237,12 +237,63 @@ def dashboard():
 def ping():
     return jsonify({'status': 'ok', 'server': 'solar-management', 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
 
+@app.route('/api/update', methods=['GET'])
+def update_from_esp32():
+    args = request.args
+    if not args or len(args) < 3:
+        return jsonify({'error': 'No query params'}), 400
+
+    try:
+        system_data['inverter_voltage'] = float(args.get('iv', 0))
+        system_data['inverter_current'] = float(args.get('ic', 0))
+        system_data['inverter_power'] = float(args.get('ip', 0))
+        system_data['energy_produced_kwh'] = float(args.get('ie', 0))
+        system_data['load_voltage'] = float(args.get('lv', 0))
+        system_data['load_current'] = float(args.get('lc', 0))
+        system_data['load_power'] = float(args.get('lp', 0))
+        system_data['energy_consumed_kwh'] = float(args.get('le', 0))
+        system_data['battery_voltage'] = float(args.get('bv', 0))
+        system_data['battery_current'] = float(args.get('bc', 0))
+        system_data['battery_soc'] = float(args.get('bs', 0))
+        system_data['load1_state'] = args.get('r1', 'OFF')
+        system_data['load2_state'] = args.get('r2', 'OFF')
+        system_data['power_balance'] = system_data['inverter_power'] - system_data['load_power']
+        system_data['load1_power'] = system_data['load_power']
+        system_data['load2_power'] = 0
+        system_data['trip_state'] = 'NOR'
+        system_data['phase'] = 'P1'
+        system_data['esp32_online'] = True
+        system_data['last_esp32_seen'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        system_data['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        real_time_power.append({
+            'timestamp': datetime.now(),
+            'consumed': system_data['load_power'],
+            'produced': system_data['inverter_power']
+        })
+
+        system_data['predictions'] = calculate_energy_predictions()
+        system_data['recommendations'] = generate_recommendations()
+
+        print(f"OK Load:{system_data['load_power']:.1f}W Inv:{system_data['inverter_power']:.1f}W Bat:{system_data['battery_soc']:.1f}%")
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        print(f"Update error: {e}")
+        return jsonify({'error': str(e)}), 400
+
 @app.route('/api/data', methods=['GET', 'POST'])
 def handle_data():
     if request.method == 'POST':
-        data = request.get_json(force=True)
-        if not data:
-            return jsonify({'error': 'No JSON data received'}), 400
+        try:
+            raw = request.get_data(as_text=True)
+            print(f"RAW POST [{len(raw)} bytes]: {raw[:300]}")
+            data = json.loads(raw)
+        except Exception as e:
+            print(f"JSON parse error: {e} | raw: {raw[:200] if 'raw' in dir() else 'N/A'}")
+            return jsonify({'error': str(e)}), 400
+
+        if not data or len(data) < 3:
+            return jsonify({'error': 'Empty or incomplete data'}), 400
 
         system_data['battery_voltage'] = float(data.get('battery_voltage', 0))
         system_data['battery_current'] = float(data.get('battery_current', 0))
@@ -275,7 +326,7 @@ def handle_data():
         system_data['predictions'] = calculate_energy_predictions()
         system_data['recommendations'] = generate_recommendations()
 
-        print(f"Data received | Load: {system_data['load_power']:.1f}W | Inv: {system_data['inverter_power']:.1f}W | Bat: {system_data['battery_soc']:.1f}%")
+        print(f"OK Load: {system_data['load_power']:.1f}W | Inv: {system_data['inverter_power']:.1f}W | Bat: {system_data['battery_soc']:.1f}%")
         return jsonify({'status': 'ok'}), 200
 
     return jsonify(system_data)
@@ -314,22 +365,24 @@ def control_relay():
     print(f"Relay command queued: Relay {relay} -> {state}")
     return jsonify({'status': 'ok', 'cmd': cmd})
 
-@app.route('/api/relay/ack', methods=['POST'])
+@app.route('/api/relay/ack', methods=['GET', 'POST'])
 def relay_ack():
-    data = request.get_json(force=True)
-    if not data:
-        return jsonify({'error': 'No JSON data received'}), 400
-
-    relay = data.get('relay')
-    state = data.get('state', 'OFF')
-    status = data.get('status', 'ok')
+    if request.method == 'GET':
+        relay = request.args.get('relay', type=int)
+        state = request.args.get('state', 'OFF')
+    else:
+        data = request.get_json(force=True)
+        if not data:
+            return jsonify({'error': 'No data'}), 400
+        relay = data.get('relay')
+        state = data.get('state', 'OFF')
 
     if relay == 1:
         system_data['load1_state'] = state
     elif relay == 2:
         system_data['load2_state'] = state
 
-    print(f"Relay ACK: Relay {relay} -> {state} (status: {status})")
+    print(f"Relay ACK: Relay {relay} -> {state}")
     return jsonify({'status': 'ok'})
 
 @app.route('/api/real_time_power')

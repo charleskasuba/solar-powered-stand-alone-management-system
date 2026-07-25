@@ -89,33 +89,21 @@ int httpGET(const char* url, String& response) {
   return httpCode;
 }
 
-// ========== Send Sensor Data ==========
+// ========== Send Sensor Data via GET query params ==========
 void sendSensorData() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi not connected, skipping send");
     return;
   }
 
-  char json[512];
-  snprintf(json, sizeof(json),
-    "{\"inverter_voltage\":%.1f,"
-    "\"inverter_current\":%.2f,"
-    "\"inverter_power\":%.1f,"
-    "\"inverter_energy\":%.2f,"
-    "\"inverter_pf\":%.2f,"
-    "\"load_voltage\":%.1f,"
-    "\"load_current\":%.2f,"
-    "\"load_power\":%.1f,"
-    "\"load_energy\":%.2f,"
-    "\"load_pf\":%.2f,"
-    "\"battery_voltage\":%.2f,"
-    "\"battery_current\":%.2f,"
-    "\"battery_power\":%.2f,"
-    "\"battery_soc\":%.1f,"
-    "\"battery_capacity_ah\":%.0f,"
-    "\"relay1_state\":\"%s\","
-    "\"relay2_state\":\"%s\","
-    "\"trip_state\":\"NOR\"}",
+  char url[600];
+  snprintf(url, sizeof(url),
+    "%s/api/update?"
+    "iv=%.1f&ic=%.2f&ip=%.1f&ie=%.2f&ipf=%.2f"
+    "&lv=%.1f&lc=%.2f&lp=%.1f&le=%.2f&lpf=%.2f"
+    "&bv=%.2f&bc=%.2f&bp=%.2f&bs=%.1f&ba=%.0f"
+    "&r1=%s&r2=%s",
+    SERVER_URL,
     p_voltage, p_current, p_power, p_energy, p_pf,
     l_voltage, l_current, l_power, l_energy, l_pf,
     batt_voltage, batt_current_A, batt_power_W, batt_soc, BATTERY_CAPACITY_AH,
@@ -123,20 +111,16 @@ void sendSensorData() {
     relay2State ? "ON" : "OFF"
   );
 
-  String url = String(SERVER_URL) + "/api/data";
   String resp;
-  int code = httpPOST(url.c_str(), json, resp);
+  int code = httpGET(url, resp);
 
   sendCount++;
   if (code == 200) {
     failCount = 0;
-    Serial.printf("[OK] Data sent (#%d) - Response: %s\n", sendCount, resp.c_str());
+    Serial.printf("[OK] Data sent (#%d)\n", sendCount);
   } else {
     failCount++;
-    Serial.printf("[FAIL] Data send #%d failed, HTTP code: %d\n", sendCount, code);
-    if (resp.length() > 0) {
-      Serial.printf("  Response body: %s\n", resp.c_str());
-    }
+    Serial.printf("[FAIL] Data send #%d, HTTP: %d\n", sendCount, code);
   }
 }
 
@@ -169,14 +153,11 @@ void pollCommands() {
       Serial.printf(">> Relay 2 -> %s\n", turnOn ? "ON" : "OFF");
     }
 
-    char ack[128];
-    snprintf(ack, sizeof(ack),
-      "{\"relay\":%d,\"state\":\"%s\",\"status\":\"ok\"}",
-      relay, turnOn ? "ON" : "OFF");
-
+    char ackUrl[256];
+    snprintf(ackUrl, sizeof(ackUrl), "%s/api/relay/ack?relay=%d&state=%s",
+      SERVER_URL, relay, turnOn ? "ON" : "OFF");
     String ackResp;
-    String ackUrl = String(SERVER_URL) + "/api/relay/ack";
-    httpPOST(ackUrl.c_str(), ack, ackResp);
+    httpGET(ackUrl, ackResp);
   }
 }
 
