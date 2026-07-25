@@ -233,6 +233,10 @@ def update_weather_periodically():
 def dashboard():
     return render_template_string(HTML_TEMPLATE)
 
+@app.route('/api/ping', methods=['GET', 'POST'])
+def ping():
+    return jsonify({'status': 'ok', 'server': 'solar-management', 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+
 @app.route('/api/data', methods=['GET', 'POST'])
 def handle_data():
     if request.method == 'POST':
