@@ -26,25 +26,23 @@ HISTORICAL_DATA_FILE = 'historical_power_data.csv'
 
 # ========== GLOBAL DATA STORAGE ==========
 system_data = {
-    'battery_voltage': 12.3,
-    'battery_current': 4.21,
-    'battery_soc': 70.2,
-    'inverter_voltage': 220,
-    'inverter_current': 2.682,
-    'inverter_power': 590.0,
-    'load_voltage': 220,
-    'load_current': 2.518,
-    'load_power': 554.0,
-    'energy_consumed_kwh': 0.0,
-    'energy_produced_kwh': 0.0,
-    'load1_state': 'ON',
-    'load2_state': 'ON',
-    'load3_state': 'OFF',
-    'load1_power': 388.0,
-    'load2_power': 166.0,
-    'load3_power': 0,
-    'trip_state': 'NORMAL',
-    'power_balance': 36.0,
+    'battery_voltage': 0,
+    'battery_current': 0,
+    'battery_soc': 0,
+    'inverter_voltage': 0,
+    'inverter_current': 0,
+    'inverter_power': 0,
+    'load_voltage': 0,
+    'load_current': 0,
+    'load_power': 0,
+    'energy_consumed_kwh': 0,
+    'energy_produced_kwh': 0,
+    'load1_state': 'OFF',
+    'load2_state': 'OFF',
+    'load1_power': 0,
+    'load2_power': 0,
+    'trip_state': 'NOR',
+    'power_balance': 0,
     'phase': 'P1',
     'weather': {
         'current': {'temperature': 25, 'condition': 'Mild'},
@@ -193,10 +191,10 @@ def generate_recommendations():
         recommendations.append("☀️ Peak solar production time. Good for running high-power devices.")
     
     # Load specific recommendations
-    if system_data['load2_state'] == 'OFF' and system_data['load3_state'] == 'OFF':
+    if system_data['load2_state'] == 'OFF':
         recommendations.append("💡 Only essential load running. Great energy saving!")
-    elif system_data['load2_state'] == 'ON' and system_data['load3_state'] == 'ON':
-        recommendations.append("⚠️ All loads active. Monitor power to avoid overload.")
+    elif system_data['load2_state'] == 'ON':
+        recommendations.append("⚠️ Both loads active. Monitor power to avoid overload.")
     
     # Default recommendations if needed
     if len(recommendations) < 2:
@@ -276,12 +274,10 @@ def read_esp32_data():
 
                 system_data['load1_state'] = data.get('relay1_state', 'OFF')
                 system_data['load2_state'] = data.get('relay2_state', 'OFF')
-                system_data['load3_state'] = 'OFF'
 
                 system_data['power_balance'] = system_data['inverter_power'] - system_data['load_power']
                 system_data['load1_power'] = system_data['load_power']
                 system_data['load2_power'] = 0
-                system_data['load3_power'] = 0
                 system_data['trip_state'] = 'NOR'
                 system_data['phase'] = 'P1'
 
@@ -441,7 +437,6 @@ HTML_TEMPLATE = """
                 <div style="margin: 15px 0;">
                     <span class="load-badge load-on" id="load1-badge">🔴 Load 1: ON</span>
                     <span class="load-badge load-off" id="load2-badge">🟢 Load 2: OFF</span>
-                    <span class="load-badge load-off" id="load3-badge">🔵 Load 3: OFF</span>
                 </div>
                 <div id="load-powers" style="font-size: 14px; color: #666;"></div>
                 <div class="value" id="energy-consumed">0.000000<span class="unit">kWh</span></div>
@@ -580,12 +575,10 @@ HTML_TEMPLATE = """
                     // Load badges
                     document.getElementById('load1-badge').innerHTML = '🔴 Load 1: ' + data.load1_state;
                     document.getElementById('load2-badge').innerHTML = '🟢 Load 2: ' + data.load2_state;
-                    document.getElementById('load3-badge').innerHTML = '🔵 Load 3: ' + data.load3_state;
                     document.getElementById('load1-badge').className = 'load-badge ' + (data.load1_state === 'ON' ? 'load-on' : 'load-off');
                     document.getElementById('load2-badge').className = 'load-badge ' + (data.load2_state === 'ON' ? 'load-on' : 'load-off');
-                    document.getElementById('load3-badge').className = 'load-badge ' + (data.load3_state === 'ON' ? 'load-on' : 'load-off');
                     
-                    document.getElementById('load-powers').innerHTML = `L1: ${data.load1_power?.toFixed(0) || 0}W | L2: ${data.load2_power?.toFixed(0) || 0}W | L3: ${data.load3_power?.toFixed(0) || 0}W`;
+                    document.getElementById('load-powers').innerHTML = `L1: ${data.load1_power?.toFixed(0) || 0}W | L2: ${data.load2_power?.toFixed(0) || 0}W`;
                     
                     const tripElement = document.getElementById('trip-status');
                     tripElement.textContent = data.trip_state;
@@ -742,8 +735,7 @@ if __name__ == '__main__':
     print("=" * 70)
     print("Load Configuration:")
     print("  - Load 1: DIRECT TO GRID (388W) - Always ON")
-    print("  - Load 2: Relay on PIN 6 (166W)")
-    print("  - Load 3: Relay on PIN 5 (198W)")
+    print("  - Load 2: Relay on PIN 4 (166W)")
     print("=" * 70)
     print(f"📡 ESP32 API: {ESP32_API_URL}")
     print(f"📍 Location: Copperbelt University, Kitwe, Zambia")
