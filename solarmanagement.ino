@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <PZEM004Tv30.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
@@ -54,9 +55,10 @@ float calculateBatterySoC(float voltage) {
 
 // ========== HTTP with SSL bypass ==========
 int httpPOST(const char* url, const char* jsonBody, String& response) {
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
-  http.begin(url);
-  http.setInsecure();
+  http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(10000);
   int code = http.POST((uint8_t*)jsonBody, strlen(jsonBody));
@@ -71,9 +73,10 @@ int httpPOST(const char* url, const char* jsonBody, String& response) {
 }
 
 int httpGET(const char* url, String& response) {
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
-  http.begin(url);
-  http.setInsecure();
+  http.begin(client, url);
   http.setTimeout(10000);
   int code = http.GET();
   if (code > 0) {
