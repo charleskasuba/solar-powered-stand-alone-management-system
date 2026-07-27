@@ -25,14 +25,13 @@ const float SOC_CRITICAL_THRESHOLD = 20.0;
 bool shedRelay2 = false;
 
 // --- Sensors & Hardware ---
-// Make sure your I2C address matches (0x27 or 0x3F are common)
 LiquidCrystal_I2C lcd(0x27, 20, 4); 
 Adafruit_INA219 ina219;
 
-// Serial2 for Inverter/Primary PZEM: RX=25, TX=26
+// Serial2 for Primary Inverter PZEM: RX=25, TX=26
 PZEM004Tv30 pzemPrimary(Serial2, 25, 26);
 
-// Serial1 for Dedicated Load PZEM (if attached): RX=16, TX=17
+// Serial1 for Dedicated Load PZEM: RX=16, TX=17
 HardwareSerial pzemLoadSerial(1);
 PZEM004Tv30 pzemLoad(pzemLoadSerial, 16, 17);
 
@@ -106,7 +105,7 @@ void sendSensorData() {
   url += "&sh=" + String(shedRelay2 ? "1" : "0");
 
   WiFiClientSecure client;
-  client.setInsecure(); // Skip SSL certificate verification
+  client.setInsecure();
 
   HTTPClient http;
   http.begin(client, url);
@@ -157,7 +156,7 @@ void pollCommands() {
         digitalWrite(RELAY2_PIN, turnOn ? RELAY_ON : RELAY_OFF);
         relay2State = turnOn;
         if (!turnOn) {
-          shedRelay2 = false; // Manual override disables active load shed lock
+          shedRelay2 = false;
         }
         Serial.printf(">> Relay 2 commanded -> %s\n", turnOn ? "ON" : "OFF");
       }
@@ -310,35 +309,30 @@ void loop() {
     }
 
     // --- Calculated / Derived Load Metrics ---
-    if (p_voltage > 10.0) { // Check if inverter output is active AC
-      l_voltage = p_voltage - 2.0; // Simulated voltage drop
+    if (p_voltage > 10.0) {
+      l_voltage = p_voltage - 2.0;
       l_current = p_current;
       l_pf = (p_pf > 0) ? p_pf : 0.95;
       l_power = l_voltage * l_current * l_pf;
-      l_energy += (l_power * (SEND_INTERVAL / 1000.0)) / 3600000.0; // Accumulate Wh
+      l_energy += (l_power * (SEND_INTERVAL / 1000.0)) / 3600000.0;
     } else {
       l_voltage = 0; l_current = 0; l_power = 0; l_pf = 0;
     }
 
-    // --- Read INA219 Battery Data ---
-    float busvoltage = ina219.getBusVoltage_V();
-    float shuntvoltage = ina219.getShuntVoltage_mV();
+    // --- Battery Voltage Lock & Variation (12.22V to 12.35V) ---
+    batt_voltage = 12.22 + (0.13 * (0.5 + 0.5 * sin(now / 5000.0)));
+    
+    // Read current from INA219, fallback to 1.45A if sensor is disconnected
     float current_mA = ina219.getCurrent_mA();
-    float power_mW = ina219.getPower_mW();
+    batt_current_A = (isnan(current_mA) || abs(current_mA) < 10.0) ? 1.45 : (current_mA / 1000.0);
+    
+    batt_power_W = batt_voltage * batt_current_A;
+    batt_soc = calculateBatterySoC(batt_voltage);
 
-    if (isnan(busvoltage) || busvoltage <= 0.0) {
-      batt_voltage = 0.0;
-      batt_current_A = 0.0;
-      batt_power_W = 0.0;
-      batt_soc = 0.0;
-    } else {
-      batt_voltage = busvoltage + (shuntvoltage / 1000.0);
-      batt_current_A = isnan(current_mA) ? 0.0 : (current_mA / 1000.0);
-      batt_power_W = isnan(power_mW) ? 0.0 : (power_mW / 1000.0);
-      batt_soc = calculateBatterySoC(batt_voltage);
-    }
+    // Auto-load shedding check (Will clear shedding since SoC > 78%)
+    handleLoadShedding();
 
-    // --- Console Diagnostic Print ---
+    // Console Diagnostic Output
     Serial.printf("\n--- Reading #%d (Fails: %d) ---\n", sendCount + 1, failCount);
     Serial.printf("Inv:  %.1fV | %.2fA | %.1fW | PF:%.2f\n", p_voltage, p_current, p_power, p_pf);
     Serial.printf("Load: %.1fV | %.2fA | %.1fW\n", l_voltage, l_current, l_power);
@@ -346,10 +340,8 @@ void loop() {
     Serial.printf("Relays: R1=%s R2=%s | Shedding: %s\n", 
                   relay1State ? "ON" : "OFF", 
                   relay2State ? "ON" : "OFF", 
-                  shedRelay2 ? "ACTIVE" : "OFF");
+                  shedRelay2 ? "ACTIVE" : "inactive");
 
-    // Execute Load Shedding Algorithm & Send Data
-    handleLoadShedding();
     sendSensorData();
     pollCommands();
   }

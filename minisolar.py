@@ -36,13 +36,6 @@ DB_FILE = 'solar_data.db'
 ZMW_PER_KWH = 2.5
 KG_CO2_PER_KWH = 0.5
 
-SHEDDING_CONFIG = {
-    'soc_critical': 20,
-    'soc_warning': 30,
-    'priority_relays': [2, 1],
-    'hysteresis': 5
-}
-
 # ========== GLOBAL DATA STORAGE ==========
 system_data = {
     'battery_voltage': 0, 'battery_current': 0, 'battery_soc': 0,
@@ -52,7 +45,6 @@ system_data = {
     'load1_state': 'OFF', 'load2_state': 'OFF',
     'load1_power': 0, 'load2_power': 0,
     'trip_state': 'NOR', 'power_balance': 0, 'phase': 'P1',
-    'load_shedding_active': False, 'shed_relays': [],
     'weather': {'current': {'temperature': 25, 'condition': 'Mild'}, 'daily': []},
     'sunlight': {'uv_index': 5, 'sunrise': '06:00', 'sunset': '18:00'},
     'predictions': {'today_energy': 0, 'tomorrow_energy': 0, 'weekly_energy': 0, 'peak_hours': []},
@@ -83,11 +75,6 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
         relay INTEGER, state TEXT, source TEXT
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS shedding_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
-        battery_soc REAL, load_power REAL, relay_shed INTEGER, action TEXT
     )''')
     conn.commit()
     conn.close()
@@ -126,17 +113,6 @@ def log_relay_event(relay, state, source='manual'):
     except Exception as e:
         print(f"DB relay log error: {e}")
 
-def log_shedding_event(battery_soc, load_power, relay_shed, action):
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('INSERT INTO shedding_events (timestamp, battery_soc, load_power, relay_shed, action) VALUES (?, ?, ?, ?, ?)',
-                  (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), battery_soc, load_power, relay_shed, action))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"DB shedding log error: {e}")
-
 def get_readings_between(start_date, end_date):
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -156,49 +132,6 @@ def get_relay_events_between(start_date, end_date):
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return rows
-
-def get_shedding_events_between(start_date, end_date):
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute('SELECT * FROM shedding_events WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp',
-              (start_date, end_date))
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
-
-# ========== LOAD SHEDDING ==========
-def check_load_shedding():
-    soc = system_data['battery_soc']
-    critical = SHEDDING_CONFIG['soc_critical']
-    warning = SHEDDING_CONFIG['soc_warning']
-    hyst = SHEDDING_CONFIG['hysteresis']
-    was_active = system_data['load_shedding_active']
-
-    if soc < critical and not system_data['load_shedding_active']:
-        relay = SHEDDING_CONFIG['priority_relays'][0]
-        system_data['load_shedding_active'] = True
-        system_data['shed_relays'] = [relay]
-        cmd = {'cmd': 'relay', 'relay': relay, 'state': 'OFF', 'id': int(time.time() * 1000)}
-        with command_lock:
-            command_queue.append(cmd)
-        log_shedding_event(soc, system_data['load_power'], relay, 'SHED')
-        log_relay_event(relay, 'OFF', 'auto_shedding')
-        print(f"SHEDDING: Relay {relay} OFF - Battery critical ({soc:.1f}%)")
-
-    elif soc > critical + hyst and system_data['load_shedding_active']:
-        for relay in system_data['shed_relays']:
-            cmd = {'cmd': 'relay', 'relay': relay, 'state': 'ON', 'id': int(time.time() * 1000)}
-            with command_lock:
-                command_queue.append(cmd)
-            log_relay_event(relay, 'ON', 'auto_recovery')
-            log_shedding_event(soc, system_data['load_power'], relay, 'RECOVER')
-            print(f"SHEDDING: Relay {relay} ON - Battery recovered ({soc:.1f}%)")
-        system_data['load_shedding_active'] = False
-        system_data['shed_relays'] = []
-
-    if was_active and not system_data['load_shedding_active']:
-        pass
 
 # ========== HISTORICAL DATA ==========
 def init_historical_data():
@@ -281,10 +214,8 @@ def generate_recommendations():
     if not system_data['esp32_online']:
         recommendations.append("ESP32 is OFFLINE. Check WiFi connection.")
         return recommendations
-    if system_data['load_shedding_active']:
-        recommendations.append(f"AUTO SHEDDING ACTIVE - Relay(s) {system_data['shed_relays']} OFF due to low battery ({battery_soc:.0f}%)")
-    if battery_soc < SHEDDING_CONFIG['soc_warning']:
-        recommendations.append(f"Battery LOW ({battery_soc:.0f}%). Critical threshold: {SHEDDING_CONFIG['soc_critical']}%")
+    if battery_soc < 30:
+        recommendations.append(f"Battery LOW ({battery_soc:.0f}%). Consider reducing load.")
     if load_power > 700:
         recommendations.append("High power consumption (>{:.0f}W). Consider turning off non-essential loads.".format(load_power))
     elif load_power > 550:
@@ -401,7 +332,6 @@ def update_from_esp32():
         })
 
         log_sensor_reading()
-        check_load_shedding()
         system_data['predictions'] = calculate_energy_predictions()
         system_data['recommendations'] = generate_recommendations()
 
@@ -439,7 +369,6 @@ def handle_data():
         system_data['last_esp32_seen'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         system_data['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         log_sensor_reading()
-        check_load_shedding()
         system_data['predictions'] = calculate_energy_predictions()
         system_data['recommendations'] = generate_recommendations()
         return jsonify({'status': 'ok'}), 200
@@ -508,25 +437,6 @@ def get_historical_data():
             'produced': daily_avg['produced'].tolist()
         })
     return jsonify({'timestamps': [], 'consumed': [], 'produced': []})
-
-@app.route('/api/load_shedding', methods=['GET', 'POST'])
-def load_shedding_config():
-    if request.method == 'POST':
-        data = request.get_json(force=True)
-        if data:
-            if 'soc_critical' in data:
-                SHEDDING_CONFIG['soc_critical'] = float(data['soc_critical'])
-            if 'soc_warning' in data:
-                SHEDDING_CONFIG['soc_warning'] = float(data['soc_warning'])
-            if 'priority_relays' in data:
-                SHEDDING_CONFIG['priority_relays'] = data['priority_relays']
-        return jsonify({'status': 'ok', 'config': SHEDDING_CONFIG})
-    return jsonify({
-        'config': SHEDDING_CONFIG,
-        'active': system_data['load_shedding_active'],
-        'shed_relays': system_data['shed_relays'],
-        'current_soc': system_data['battery_soc']
-    })
 
 @app.route('/api/comparison')
 def get_comparison():
@@ -641,7 +551,6 @@ def monthly_report():
     end_date = f"{year}-{month:02d}-{last_day:02d} 23:59:59"
     rows = get_readings_between(start_date, end_date)
     relay_events = get_relay_events_between(start_date, end_date)
-    shedding_events = get_shedding_events_between(start_date, end_date)
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=20*mm, bottomMargin=20*mm)
@@ -689,23 +598,6 @@ def monthly_report():
         elements.append(table)
     else:
         elements.append(Paragraph("No data available for this period.", styles['Normal']))
-
-    elements.append(Spacer(1, 10*mm))
-    elements.append(Paragraph("Load Shedding Events", styles['Heading2']))
-    if shedding_events:
-        shed_data = [['Timestamp', 'SOC%', 'Load W', 'Relay', 'Action']]
-        for e in shedding_events:
-            shed_data.append([e['timestamp'], f"{e['battery_soc']:.1f}", f"{e['load_power']:.1f}", str(e['relay_shed']), e['action']])
-        shed_table = Table(shed_data, colWidths=[130, 50, 60, 40, 60])
-        shed_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#ff9800')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('FONTSIZE', (0, 0), (-1, -1), 8),
-        ]))
-        elements.append(shed_table)
-    else:
-        elements.append(Paragraph("No load shedding events this month.", styles['Normal']))
 
     elements.append(Spacer(1, 10*mm))
     elements.append(Paragraph("Relay Events", styles['Heading2']))
@@ -783,8 +675,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .balance-positive{color:#4CAF50}
         .balance-negative{color:#f44336}
         .esp-status{margin-top:10px;font-size:13px}
-        .shedding-active{background:#f44336;color:white;padding:10px;border-radius:8px;margin:10px 0;font-weight:bold}
-        .shedding-normal{background:#4CAF50;color:white;padding:10px;border-radius:8px;margin:10px 0}
         .export-btn{display:inline-block;padding:10px 20px;border:none;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;margin:5px;color:white;transition:all .2s}
         .export-csv{background:#2196F3}.export-csv:hover{background:#1976D2}
         .export-excel{background:#4CAF50}.export-excel:hover{background:#388E3C}
@@ -851,15 +741,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
 
         <div class="grid">
-            <div class="card">
-                <div class="card-header">Load Shedding Status</div>
-                <div id="shedding-status"></div>
-                <div style="margin-top:15px">
-                    <div class="config-label">Critical SOC Threshold: <input type="number" id="cfg-critical" class="config-input" value="20" min="5" max="50">% </div>
-                    <div class="config-label">Warning SOC Threshold: <input type="number" id="cfg-warning" class="config-input" value="30" min="10" max="60">%</div>
-                    <button class="relay-btn relay-btn-on" onclick="updateSheddingConfig()" style="margin-top:10px">Update Thresholds</button>
-                </div>
-            </div>
             <div class="card">
                 <div class="card-header">Export & Reports</div>
                 <div style="margin:10px 0">
@@ -933,9 +814,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             ]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top'},title:{display:true,text:'Last 60 Seconds'}},scales:{y:{beginAtZero:true,title:{display:true,text:'Watts'}},x:{title:{display:true,text:'Time'}}}}});
         }
         function sendRelayCmd(r,s){fetch('/api/relay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:r,state:s})}).then(r=>r.json()).then(d=>console.log(d)).catch(e=>console.error(e));}
-        function updateSheddingConfig(){
-            fetch('/api/load_shedding',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({soc_critical:parseFloat(document.getElementById('cfg-critical').value),soc_warning:parseFloat(document.getElementById('cfg-warning').value)})}).then(r=>r.json()).then(d=>alert('Updated: '+JSON.stringify(d.config))).catch(e=>alert('Error: '+e));
-        }
         function exportCSV(){
             const s=document.getElementById('export-start').value||new Date(Date.now()-30*86400000).toISOString().slice(0,10);
             const e=document.getElementById('export-end').value||new Date().toISOString().slice(0,10);
@@ -974,9 +852,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 t.className='status '+(d.trip_state==='OVL'?'status-overload':d.trip_state==='NOR'?'status-normal':'status-tripped');
                 const e=document.getElementById('esp-status');
                 e.innerHTML=d.esp32_online?'<span style="color:#4CAF50;font-weight:bold">ESP32 ONLINE</span> | '+d.last_esp32_seen:'<span style="color:#f44336;font-weight:bold">ESP32 OFFLINE</span>';
-                const sh=document.getElementById('shedding-status');
-                if(d.load_shedding_active){sh.innerHTML='<div class="shedding-active">LOAD SHEDDING ACTIVE - Relay(s) '+d.shed_relays+' OFF (Low Battery)</div>';}
-                else{sh.innerHTML='<div class="shedding-normal">Auto-Shedding: Standby (Threshold: '+document.getElementById('cfg-critical').value+'%)</div>';}
                 if(d.predictions){
                     document.getElementById('pred-today').innerHTML=d.predictions.today_energy+'<span class="unit">kWh</span>';
                     document.getElementById('pred-tomorrow').innerHTML=d.predictions.tomorrow_energy+'<span class="unit">kWh</span>';
