@@ -10,7 +10,18 @@ from flask_cors import CORS
 import math
 import os
 import csv
+import sqlite3
+import calendar
 from collections import deque
+from io import BytesIO
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -21,57 +32,175 @@ CORS(app)
 COPPERBELT_LAT = -12.82
 COPPERBELT_LON = 28.21
 HISTORICAL_DATA_FILE = 'historical_power_data.csv'
+DB_FILE = 'solar_data.db'
+ZMW_PER_KWH = 2.5
+KG_CO2_PER_KWH = 0.5
+
+SHEDDING_CONFIG = {
+    'soc_critical': 20,
+    'soc_warning': 30,
+    'priority_relays': [2, 1],
+    'hysteresis': 5
+}
 
 # ========== GLOBAL DATA STORAGE ==========
 system_data = {
-    'battery_voltage': 0,
-    'battery_current': 0,
-    'battery_soc': 0,
-    'inverter_voltage': 0,
-    'inverter_current': 0,
-    'inverter_power': 0,
-    'load_voltage': 0,
-    'load_current': 0,
-    'load_power': 0,
-    'energy_consumed_kwh': 0,
-    'energy_produced_kwh': 0,
-    'load1_state': 'OFF',
-    'load2_state': 'OFF',
-    'load1_power': 0,
-    'load2_power': 0,
-    'trip_state': 'NOR',
-    'power_balance': 0,
-    'phase': 'P1',
-    'weather': {
-        'current': {'temperature': 25, 'condition': 'Mild'},
-        'daily': []
-    },
-    'sunlight': {
-        'uv_index': 5,
-        'sunrise': '06:00',
-        'sunset': '18:00'
-    },
-    'predictions': {
-        'today_energy': 0,
-        'tomorrow_energy': 0,
-        'weekly_energy': 0,
-        'peak_hours': []
-    },
+    'battery_voltage': 0, 'battery_current': 0, 'battery_soc': 0,
+    'inverter_voltage': 0, 'inverter_current': 0, 'inverter_power': 0,
+    'load_voltage': 0, 'load_current': 0, 'load_power': 0,
+    'energy_consumed_kwh': 0, 'energy_produced_kwh': 0,
+    'load1_state': 'OFF', 'load2_state': 'OFF',
+    'load1_power': 0, 'load2_power': 0,
+    'trip_state': 'NOR', 'power_balance': 0, 'phase': 'P1',
+    'load_shedding_active': False, 'shed_relays': [],
+    'weather': {'current': {'temperature': 25, 'condition': 'Mild'}, 'daily': []},
+    'sunlight': {'uv_index': 5, 'sunrise': '06:00', 'sunset': '18:00'},
+    'predictions': {'today_energy': 0, 'tomorrow_energy': 0, 'weekly_energy': 0, 'peak_hours': []},
     'recommendations': [],
-    'esp32_online': False,
-    'last_esp32_seen': None,
+    'esp32_online': False, 'last_esp32_seen': None,
     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 }
 
-# Command queue: list of pending commands for ESP32
 command_queue = []
 command_lock = threading.Lock()
-
-# Real-time graph data
 real_time_power = deque(maxlen=60)
 historical_power = []
 
-# ========== HISTORICAL DATA MANAGEMENT ==========
+# ========== DATABASE ==========
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS sensor_readings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+        battery_voltage REAL, battery_current REAL, battery_soc REAL,
+        inverter_voltage REAL, inverter_current REAL, inverter_power REAL,
+        load_voltage REAL, load_current REAL, load_power REAL,
+        energy_consumed_kwh REAL, energy_produced_kwh REAL,
+        relay1_state TEXT, relay2_state TEXT, power_balance REAL
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS relay_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+        relay INTEGER, state TEXT, source TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS shedding_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+        battery_soc REAL, load_power REAL, relay_shed INTEGER, action TEXT
+    )''')
+    conn.commit()
+    conn.close()
+    print("Database initialized")
+
+def log_sensor_reading():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('''INSERT INTO sensor_readings
+            (timestamp, battery_voltage, battery_current, battery_soc,
+             inverter_voltage, inverter_current, inverter_power,
+             load_voltage, load_current, load_power,
+             energy_consumed_kwh, energy_produced_kwh,
+             relay1_state, relay2_state, power_balance)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+             system_data['battery_voltage'], system_data['battery_current'], system_data['battery_soc'],
+             system_data['inverter_voltage'], system_data['inverter_current'], system_data['inverter_power'],
+             system_data['load_voltage'], system_data['load_current'], system_data['load_power'],
+             system_data['energy_consumed_kwh'], system_data['energy_produced_kwh'],
+             system_data['load1_state'], system_data['load2_state'], system_data['power_balance']))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"DB log error: {e}")
+
+def log_relay_event(relay, state, source='manual'):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('INSERT INTO relay_events (timestamp, relay, state, source) VALUES (?, ?, ?, ?)',
+                  (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), relay, state, source))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"DB relay log error: {e}")
+
+def log_shedding_event(battery_soc, load_power, relay_shed, action):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('INSERT INTO shedding_events (timestamp, battery_soc, load_power, relay_shed, action) VALUES (?, ?, ?, ?, ?)',
+                  (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), battery_soc, load_power, relay_shed, action))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"DB shedding log error: {e}")
+
+def get_readings_between(start_date, end_date):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM sensor_readings WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp',
+              (start_date, end_date))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+
+def get_relay_events_between(start_date, end_date):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM relay_events WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp',
+              (start_date, end_date))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+
+def get_shedding_events_between(start_date, end_date):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM shedding_events WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp',
+              (start_date, end_date))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+
+# ========== LOAD SHEDDING ==========
+def check_load_shedding():
+    soc = system_data['battery_soc']
+    critical = SHEDDING_CONFIG['soc_critical']
+    warning = SHEDDING_CONFIG['soc_warning']
+    hyst = SHEDDING_CONFIG['hysteresis']
+    was_active = system_data['load_shedding_active']
+
+    if soc < critical and not system_data['load_shedding_active']:
+        relay = SHEDDING_CONFIG['priority_relays'][0]
+        system_data['load_shedding_active'] = True
+        system_data['shed_relays'] = [relay]
+        cmd = {'cmd': 'relay', 'relay': relay, 'state': 'OFF', 'id': int(time.time() * 1000)}
+        with command_lock:
+            command_queue.append(cmd)
+        log_shedding_event(soc, system_data['load_power'], relay, 'SHED')
+        log_relay_event(relay, 'OFF', 'auto_shedding')
+        print(f"SHEDDING: Relay {relay} OFF - Battery critical ({soc:.1f}%)")
+
+    elif soc > critical + hyst and system_data['load_shedding_active']:
+        for relay in system_data['shed_relays']:
+            cmd = {'cmd': 'relay', 'relay': relay, 'state': 'ON', 'id': int(time.time() * 1000)}
+            with command_lock:
+                command_queue.append(cmd)
+            log_relay_event(relay, 'ON', 'auto_recovery')
+            log_shedding_event(soc, system_data['load_power'], relay, 'RECOVER')
+            print(f"SHEDDING: Relay {relay} ON - Battery recovered ({soc:.1f}%)")
+        system_data['load_shedding_active'] = False
+        system_data['shed_relays'] = []
+
+    if was_active and not system_data['load_shedding_active']:
+        pass
+
+# ========== HISTORICAL DATA ==========
 def init_historical_data():
     global historical_power
     print("Generating 2 months of historical data...")
@@ -120,15 +249,7 @@ def save_historical_to_csv():
 # ========== PREDICTIONS ==========
 def calculate_energy_predictions():
     if len(historical_power) < 24:
-        return {
-            'today_energy': 5.5,
-            'tomorrow_energy': 5.8,
-            'weekly_energy': 40,
-            'peak_hours': [
-                {'hour': '06:00-09:00', 'factor': 1.3, 'reason': 'Morning peak'},
-                {'hour': '17:00-21:00', 'factor': 1.5, 'reason': 'Evening peak'}
-            ]
-        }
+        return {'today_energy': 5.5, 'tomorrow_energy': 5.8, 'weekly_energy': 40, 'peak_hours': []}
     df = pd.DataFrame(historical_power)
     df['hour'] = df['timestamp'].dt.hour
     hourly_avg = df.groupby('hour')['consumed'].mean()
@@ -160,24 +281,22 @@ def generate_recommendations():
     if not system_data['esp32_online']:
         recommendations.append("ESP32 is OFFLINE. Check WiFi connection.")
         return recommendations
+    if system_data['load_shedding_active']:
+        recommendations.append(f"AUTO SHEDDING ACTIVE - Relay(s) {system_data['shed_relays']} OFF due to low battery ({battery_soc:.0f}%)")
+    if battery_soc < SHEDDING_CONFIG['soc_warning']:
+        recommendations.append(f"Battery LOW ({battery_soc:.0f}%). Critical threshold: {SHEDDING_CONFIG['soc_critical']}%")
     if load_power > 700:
         recommendations.append("High power consumption (>{:.0f}W). Consider turning off non-essential loads.".format(load_power))
     elif load_power > 550:
         recommendations.append("Moderate power consumption. Monitor during peak hours.")
     elif load_power < 300:
         recommendations.append("Low power consumption. Good energy practice!")
-    if battery_soc < 30:
-        recommendations.append("Battery level low ({:.0f}%). Reduce consumption to prevent outage.".format(battery_soc))
-    elif battery_soc > 80:
+    if battery_soc > 80:
         recommendations.append("Battery well charged ({:.0f}%). Good for evening peak hours.".format(battery_soc))
     if 17 <= current_hour <= 21:
         recommendations.append("Evening peak hour. Run heavy appliances before 5PM or after 9PM.")
     elif 11 <= current_hour <= 14:
         recommendations.append("Peak solar production time. Good for running high-power devices.")
-    if system_data['load2_state'] == 'OFF':
-        recommendations.append("Only essential load running. Great energy saving!")
-    elif system_data['load2_state'] == 'ON':
-        recommendations.append("Both loads active. Monitor power to avoid overload.")
     if len(recommendations) < 2:
         recommendations.append("Schedule heavy appliances during daytime for solar power.")
     return recommendations[:4]
@@ -186,11 +305,9 @@ def generate_recommendations():
 def get_weather_data():
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
-        "latitude": COPPERBELT_LAT,
-        "longitude": COPPERBELT_LON,
+        "latitude": COPPERBELT_LAT, "longitude": COPPERBELT_LON,
         "daily": ["temperature_2m_max", "temperature_2m_min", "sunrise", "sunset", "uv_index_max"],
-        "timezone": "Africa/Lusaka",
-        "forecast_days": 7
+        "timezone": "Africa/Lusaka", "forecast_days": 7
     }
     try:
         response = requests.get(url, params=params, timeout=10)
@@ -227,22 +344,33 @@ def update_weather_periodically():
         get_weather_data()
         time.sleep(3600)
 
-# ========== FLASK API ROUTES ==========
+def check_esp32_status():
+    while True:
+        time.sleep(15)
+        if system_data['last_esp32_seen']:
+            last = datetime.strptime(system_data['last_esp32_seen'], '%Y-%m-%d %H:%M:%S')
+            if (datetime.now() - last).total_seconds() > 20:
+                if system_data['esp32_online']:
+                    system_data['esp32_online'] = False
+                    system_data['recommendations'] = generate_recommendations()
+                    print("ESP32 went OFFLINE")
+        elif system_data['esp32_online']:
+            system_data['esp32_online'] = False
 
+# ========== FLASK API ROUTES ==========
 @app.route('/')
 def dashboard():
     return render_template_string(HTML_TEMPLATE)
 
 @app.route('/api/ping', methods=['GET', 'POST'])
 def ping():
-    return jsonify({'status': 'ok', 'server': 'solar-management', 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+    return jsonify({'status': 'ok', 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
 
 @app.route('/api/update', methods=['GET'])
 def update_from_esp32():
     args = request.args
     if not args or len(args) < 3:
         return jsonify({'error': 'No query params'}), 400
-
     try:
         system_data['inverter_voltage'] = float(args.get('iv', 0))
         system_data['inverter_current'] = float(args.get('ic', 0))
@@ -272,6 +400,8 @@ def update_from_esp32():
             'produced': system_data['inverter_power']
         })
 
+        log_sensor_reading()
+        check_load_shedding()
         system_data['predictions'] = calculate_energy_predictions()
         system_data['recommendations'] = generate_recommendations()
 
@@ -286,15 +416,11 @@ def handle_data():
     if request.method == 'POST':
         try:
             raw = request.get_data(as_text=True)
-            print(f"RAW POST [{len(raw)} bytes]: {raw[:300]}")
             data = json.loads(raw)
         except Exception as e:
-            print(f"JSON parse error: {e} | raw: {raw[:200] if 'raw' in dir() else 'N/A'}")
             return jsonify({'error': str(e)}), 400
-
         if not data or len(data) < 3:
-            return jsonify({'error': 'Empty or incomplete data'}), 400
-
+            return jsonify({'error': 'Empty data'}), 400
         system_data['battery_voltage'] = float(data.get('battery_voltage', 0))
         system_data['battery_current'] = float(data.get('battery_current', 0))
         system_data['battery_soc'] = float(data.get('battery_soc', 0))
@@ -309,26 +435,14 @@ def handle_data():
         system_data['load1_state'] = data.get('relay1_state', 'OFF')
         system_data['load2_state'] = data.get('relay2_state', 'OFF')
         system_data['power_balance'] = system_data['inverter_power'] - system_data['load_power']
-        system_data['load1_power'] = system_data['load_power']
-        system_data['load2_power'] = 0
-        system_data['trip_state'] = data.get('trip_state', 'NOR')
-        system_data['phase'] = 'P1'
         system_data['esp32_online'] = True
         system_data['last_esp32_seen'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         system_data['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        real_time_power.append({
-            'timestamp': datetime.now(),
-            'consumed': system_data['load_power'],
-            'produced': system_data['inverter_power']
-        })
-
+        log_sensor_reading()
+        check_load_shedding()
         system_data['predictions'] = calculate_energy_predictions()
         system_data['recommendations'] = generate_recommendations()
-
-        print(f"OK Load: {system_data['load_power']:.1f}W | Inv: {system_data['inverter_power']:.1f}W | Bat: {system_data['battery_soc']:.1f}%")
         return jsonify({'status': 'ok'}), 200
-
     return jsonify(system_data)
 
 @app.route('/api/commands', methods=['GET'])
@@ -343,26 +457,18 @@ def get_commands():
 def control_relay():
     data = request.get_json(force=True)
     if not data:
-        return jsonify({'error': 'No JSON data received'}), 400
-
+        return jsonify({'error': 'No data'}), 400
     relay = data.get('relay')
     state = data.get('state', 'ON')
-
     if relay not in [1, 2]:
-        return jsonify({'error': 'Invalid relay. Must be 1 or 2'}), 400
+        return jsonify({'error': 'Invalid relay'}), 400
     if state not in ['ON', 'OFF']:
-        return jsonify({'error': 'Invalid state. Must be ON or OFF'}), 400
-
-    cmd = {
-        'cmd': 'relay',
-        'relay': relay,
-        'state': state,
-        'id': int(time.time() * 1000)
-    }
+        return jsonify({'error': 'Invalid state'}), 400
+    cmd = {'cmd': 'relay', 'relay': relay, 'state': state, 'id': int(time.time() * 1000)}
     with command_lock:
         command_queue.append(cmd)
-
-    print(f"Relay command queued: Relay {relay} -> {state}")
+    log_relay_event(relay, state, 'manual')
+    print(f"Relay command: Relay {relay} -> {state}")
     return jsonify({'status': 'ok', 'cmd': cmd})
 
 @app.route('/api/relay/ack', methods=['GET', 'POST'])
@@ -376,12 +482,10 @@ def relay_ack():
             return jsonify({'error': 'No data'}), 400
         relay = data.get('relay')
         state = data.get('state', 'OFF')
-
     if relay == 1:
         system_data['load1_state'] = state
     elif relay == 2:
         system_data['load2_state'] = state
-
     print(f"Relay ACK: Relay {relay} -> {state}")
     return jsonify({'status': 'ok'})
 
@@ -405,29 +509,237 @@ def get_historical_data():
         })
     return jsonify({'timestamps': [], 'consumed': [], 'produced': []})
 
+@app.route('/api/load_shedding', methods=['GET', 'POST'])
+def load_shedding_config():
+    if request.method == 'POST':
+        data = request.get_json(force=True)
+        if data:
+            if 'soc_critical' in data:
+                SHEDDING_CONFIG['soc_critical'] = float(data['soc_critical'])
+            if 'soc_warning' in data:
+                SHEDDING_CONFIG['soc_warning'] = float(data['soc_warning'])
+            if 'priority_relays' in data:
+                SHEDDING_CONFIG['priority_relays'] = data['priority_relays']
+        return jsonify({'status': 'ok', 'config': SHEDDING_CONFIG})
+    return jsonify({
+        'config': SHEDDING_CONFIG,
+        'active': system_data['load_shedding_active'],
+        'shed_relays': system_data['shed_relays'],
+        'current_soc': system_data['battery_soc']
+    })
+
+@app.route('/api/comparison')
+def get_comparison():
+    now = datetime.now()
+    this_month_start = now.replace(day=1, hour=0, minute=0, second=0)
+    last_month_end = this_month_start - timedelta(seconds=1)
+    last_month_start = last_month_end.replace(day=1, hour=0, minute=0, second=0)
+
+    this_rows = get_readings_between(this_month_start.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d %H:%M:%S'))
+    last_rows = get_readings_between(last_month_start.strftime('%Y-%m-%d'), last_month_end.strftime('%Y-%m-%d %H:%M:%S'))
+
+    def daily_avg(rows):
+        if not rows:
+            return {'dates': [], 'consumed': [], 'produced': []}
+        df = pd.DataFrame(rows)
+        df['date'] = pd.to_datetime(df['timestamp']).dt.date
+        daily = df.groupby('date').agg({'load_power': 'mean', 'inverter_power': 'mean'}).reset_index()
+        return {
+            'dates': daily['date'].astype(str).tolist(),
+            'consumed': daily['load_power'].round(1).tolist(),
+            'produced': daily['inverter_power'].round(1).tolist()
+        }
+
+    return jsonify({
+        'this_month': daily_avg(this_rows),
+        'last_month': daily_avg(last_rows),
+        'this_month_label': this_month_start.strftime('%B %Y'),
+        'last_month_label': last_month_start.strftime('%B %Y')
+    })
+
+@app.route('/api/export/csv')
+def export_csv():
+    start = request.args.get('start', (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'))
+    end = request.args.get('end', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    rows = get_readings_between(start, end)
+    output = BytesIO()
+    writer_text = []
+    writer_text.append('timestamp,battery_voltage,battery_current,battery_soc,inverter_voltage,inverter_current,inverter_power,load_voltage,load_current,load_power,energy_consumed_kwh,energy_produced_kwh,relay1_state,relay2_state,power_balance\n')
+    for r in rows:
+        writer_text.append(f"{r['timestamp']},{r['battery_voltage']},{r['battery_current']},{r['battery_soc']},{r['inverter_voltage']},{r['inverter_current']},{r['inverter_power']},{r['load_voltage']},{r['load_current']},{r['load_power']},{r['energy_consumed_kwh']},{r['energy_produced_kwh']},{r['relay1_state']},{r['relay2_state']},{r['power_balance']}\n")
+    output.write(''.join(writer_text).encode('utf-8'))
+    output.seek(0)
+    filename = f"solar_data_{start}_{end[:10]}.csv"
+    return send_file(output, mimetype='text/csv', as_attachment=True, download_name=filename)
+
+@app.route('/api/export/excel')
+def export_excel():
+    start = request.args.get('start', (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'))
+    end = request.args.get('end', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    rows = get_readings_between(start, end)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sensor Readings"
+    headers = ['Timestamp', 'Battery V', 'Battery A', 'SOC%', 'Inv V', 'Inv A', 'Inv W', 'Load V', 'Load A', 'Load W', 'Cons kWh', 'Prod kWh', 'R1', 'R2', 'Balance W']
+    header_fill = PatternFill(start_color='1a1a2e', end_color='1a1a2e', fill_type='solid')
+    header_font = Font(color='FFFFFF', bold=True)
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center')
+    for i, r in enumerate(rows, 2):
+        ws.cell(row=i, column=1, value=r['timestamp'])
+        ws.cell(row=i, column=2, value=r['battery_voltage'])
+        ws.cell(row=i, column=3, value=r['battery_current'])
+        ws.cell(row=i, column=4, value=r['battery_soc'])
+        ws.cell(row=i, column=5, value=r['inverter_voltage'])
+        ws.cell(row=i, column=6, value=r['inverter_current'])
+        ws.cell(row=i, column=7, value=r['inverter_power'])
+        ws.cell(row=i, column=8, value=r['load_voltage'])
+        ws.cell(row=i, column=9, value=r['load_current'])
+        ws.cell(row=i, column=10, value=r['load_power'])
+        ws.cell(row=i, column=11, value=r['energy_consumed_kwh'])
+        ws.cell(row=i, column=12, value=r['energy_produced_kwh'])
+        ws.cell(row=i, column=13, value=r['relay1_state'])
+        ws.cell(row=i, column=14, value=r['relay2_state'])
+        ws.cell(row=i, column=15, value=r['power_balance'])
+
+    if rows:
+        df = pd.DataFrame(rows)
+        ws2 = wb.create_sheet("Summary")
+        ws2.cell(row=1, column=1, value="Metric").fill = header_fill
+        ws2.cell(row=1, column=1).font = header_font
+        ws2.cell(row=1, column=2, value="Average").fill = header_fill
+        ws2.cell(row=1, column=2).font = header_font
+        ws2.cell(row=1, column=3, value="Min").fill = header_fill
+        ws2.cell(row=1, column=3).font = header_font
+        ws2.cell(row=1, column=4, value="Max").fill = header_fill
+        ws2.cell(row=1, column=4).font = header_font
+        metrics = [('Battery SOC%', 'battery_soc'), ('Inverter Power W', 'inverter_power'),
+                   ('Load Power W', 'load_power'), ('Battery Voltage V', 'battery_voltage')]
+        for i, (name, col) in enumerate(metrics, 2):
+            ws2.cell(row=i, column=1, value=name)
+            ws2.cell(row=i, column=2, value=round(df[col].mean(), 2))
+            ws2.cell(row=i, column=3, value=round(df[col].min(), 2))
+            ws2.cell(row=i, column=4, value=round(df[col].max(), 2))
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    filename = f"solar_data_{start}_{end[:10]}.xlsx"
+    return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                     as_attachment=True, download_name=filename)
+
+@app.route('/api/report/monthly')
+def monthly_report():
+    month = request.args.get('month', datetime.now().month, type=int)
+    year = request.args.get('year', datetime.now().year, type=int)
+    start_date = f"{year}-{month:02d}-01"
+    last_day = calendar.monthrange(year, month)[1]
+    end_date = f"{year}-{month:02d}-{last_day:02d} 23:59:59"
+    rows = get_readings_between(start_date, end_date)
+    relay_events = get_relay_events_between(start_date, end_date)
+    shedding_events = get_shedding_events_between(start_date, end_date)
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=20*mm, bottomMargin=20*mm)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    title_style = ParagraphStyle('Title2', parent=styles['Title'], fontSize=20, spaceAfter=10)
+    subtitle_style = ParagraphStyle('Subtitle2', parent=styles['Normal'], fontSize=12, alignment=TA_CENTER, spaceAfter=20, textColor=colors.grey)
+    elements.append(Paragraph("Copperbelt University - Solar Microgrid", title_style))
+    elements.append(Paragraph(f"Monthly Energy Report - {calendar.month_name[month]} {year}", subtitle_style))
+    elements.append(Paragraph(f"Location: Kitwe, Zambia | Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", subtitle_style))
+    elements.append(Spacer(1, 10*mm))
+
+    elements.append(Paragraph("Summary Statistics", styles['Heading2']))
+    if rows:
+        df = pd.DataFrame(rows)
+        summary_data = [
+            ['Metric', 'Average', 'Min', 'Max', 'Unit'],
+            ['Battery SOC', f"{df['battery_soc'].mean():.1f}", f"{df['battery_soc'].min():.1f}", f"{df['battery_soc'].max():.1f}", '%'],
+            ['Battery Voltage', f"{df['battery_voltage'].mean():.2f}", f"{df['battery_voltage'].min():.2f}", f"{df['battery_voltage'].max():.2f}", 'V'],
+            ['Inverter Power', f"{df['inverter_power'].mean():.1f}", f"{df['inverter_power'].min():.1f}", f"{df['inverter_power'].max():.1f}", 'W'],
+            ['Load Power', f"{df['load_power'].mean():.1f}", f"{df['load_power'].min():.1f}", f"{df['load_power'].max():.1f}", 'W'],
+            ['Power Balance', f"{df['power_balance'].mean():.1f}", f"{df['power_balance'].min():.1f}", f"{df['power_balance'].max():.1f}", 'W'],
+        ]
+        total_energy_consumed = df['load_power'].mean() * len(rows) * 5 / 3600 / 1000
+        total_energy_produced = df['inverter_power'].mean() * len(rows) * 5 / 3600 / 1000
+        cost_savings = total_energy_produced * ZMW_PER_KWH
+        co2_offset = total_energy_produced * KG_CO2_PER_KWH
+
+        summary_data.append(['Total Energy Consumed', f"{total_energy_consumed:.2f}", '', '', 'kWh'])
+        summary_data.append(['Total Energy Produced', f"{total_energy_produced:.2f}", '', '', 'kWh'])
+        summary_data.append(['Cost Savings', f"{cost_savings:.2f}", '', '', 'ZMW'])
+        summary_data.append(['CO2 Offset', f"{co2_offset:.2f}", '', '', 'kg'])
+
+        table = Table(summary_data, colWidths=[120, 70, 70, 70, 50])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1a2e')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f0f0')]),
+        ]))
+        elements.append(table)
+    else:
+        elements.append(Paragraph("No data available for this period.", styles['Normal']))
+
+    elements.append(Spacer(1, 10*mm))
+    elements.append(Paragraph("Load Shedding Events", styles['Heading2']))
+    if shedding_events:
+        shed_data = [['Timestamp', 'SOC%', 'Load W', 'Relay', 'Action']]
+        for e in shedding_events:
+            shed_data.append([e['timestamp'], f"{e['battery_soc']:.1f}", f"{e['load_power']:.1f}", str(e['relay_shed']), e['action']])
+        shed_table = Table(shed_data, colWidths=[130, 50, 60, 40, 60])
+        shed_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#ff9800')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ]))
+        elements.append(shed_table)
+    else:
+        elements.append(Paragraph("No load shedding events this month.", styles['Normal']))
+
+    elements.append(Spacer(1, 10*mm))
+    elements.append(Paragraph("Relay Events", styles['Heading2']))
+    if relay_events:
+        relay_data = [['Timestamp', 'Relay', 'State', 'Source']]
+        for e in relay_events[:50]:
+            relay_data.append([e['timestamp'], str(e['relay']), e['state'], e['source']])
+        relay_table = Table(relay_data, colWidths=[130, 50, 50, 100])
+        relay_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2196F3')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ]))
+        elements.append(relay_table)
+    else:
+        elements.append(Paragraph("No relay events this month.", styles['Normal']))
+
+    elements.append(Spacer(1, 15*mm))
+    elements.append(Paragraph(f"Tariff: ZMW {ZMW_PER_KWH}/kWh | CO2 Factor: {KG_CO2_PER_KWH} kg/kWh", styles['Normal']))
+
+    doc.build(elements)
+    buffer.seek(0)
+    return send_file(buffer, mimetype='application/pdf', as_attachment=True,
+                     download_name=f"solar_report_{year}_{month:02d}.pdf")
+
 @app.route('/download_csv')
 def download_csv():
     if os.path.exists(HISTORICAL_DATA_FILE):
         return send_file(HISTORICAL_DATA_FILE, as_attachment=True)
     return "No data available", 404
 
-# ========== ESP32 OFFLINE CHECK ==========
-def check_esp32_status():
-    while True:
-        time.sleep(15)
-        if system_data['last_esp32_seen']:
-            last = datetime.strptime(system_data['last_esp32_seen'], '%Y-%m-%d %H:%M:%S')
-            if (datetime.now() - last).total_seconds() > 20:
-                if system_data['esp32_online']:
-                    system_data['esp32_online'] = False
-                    system_data['recommendations'] = generate_recommendations()
-                    print("ESP32 went OFFLINE")
-        elif system_data['esp32_online']:
-            system_data['esp32_online'] = False
-
 # ========== HTML DASHBOARD ==========
-HTML_TEMPLATE = """
-<!DOCTYPE html>
+HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -436,114 +748,49 @@ HTML_TEMPLATE = """
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .container { max-width: 1600px; margin: 0 auto; }
-        header { text-align: center; color: white; margin-bottom: 30px; }
-        h1 { font-size: 2.5em; margin-bottom: 10px; }
-        .subtitle { font-size: 1.1em; opacity: 0.9; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 25px; margin-bottom: 25px; }
-        .card {
-            background: white;
-            border-radius: 20px;
-            padding: 25px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-            transition: transform 0.3s;
-        }
-        .card:hover { transform: translateY(-5px); }
-        .card-header {
-            font-size: 1.3em;
-            font-weight: bold;
-            color: #1a1a2e;
-            margin-bottom: 20px;
-            border-bottom: 3px solid #1a1a2e;
-            padding-bottom: 12px;
-        }
-        .value { font-size: 2.2em; font-weight: bold; color: #333; margin: 10px 0; }
-        .unit { font-size: 0.5em; color: #666; }
-        .status {
-            padding: 8px 15px;
-            border-radius: 8px;
-            display: inline-block;
-            font-weight: bold;
-        }
-        .status-normal { background: #4CAF50; color: white; }
-        .status-offline { background: #9e9e9e; color: white; }
-        .status-overload { background: #ff9800; color: white; }
-        .status-tripped { background: #f44336; color: white; animation: blink 1s infinite; }
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-        .prediction-card {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 15px;
-            border-radius: 12px;
-            margin: 10px 0;
-        }
-        .chart-container { margin: 20px 0; height: 500px; }
-        .recommendation {
-            background: #e3f2fd;
-            padding: 12px;
-            border-radius: 10px;
-            margin: 10px 0;
-            border-left: 4px solid #2196F3;
-        }
-        .peak-hour {
-            display: inline-block;
-            background: #ff9800;
-            color: white;
-            padding: 6px 12px;
-            border-radius: 8px;
-            margin: 5px;
-            font-size: 13px;
-        }
-        .load-badge {
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 20px;
-            margin: 3px;
-            font-size: 12px;
-            font-weight: bold;
-        }
-        .load-on { background: #4CAF50; color: white; }
-        .load-off { background: #9e9e9e; color: white; }
-        .relay-btn {
-            display: inline-block;
-            padding: 8px 20px;
-            border: none;
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: bold;
-            cursor: pointer;
-            margin: 5px;
-            transition: all 0.2s;
-        }
-        .relay-btn-on {
-            background: #4CAF50;
-            color: white;
-        }
-        .relay-btn-on:hover { background: #388E3C; }
-        .relay-btn-off {
-            background: #f44336;
-            color: white;
-        }
-        .relay-btn-off:hover { background: #d32f2f; }
-        .relay-btn:disabled {
-            background: #ccc;
-            cursor: not-allowed;
-        }
-        .timestamp { font-size: 0.8em; color: #666; margin-top: 20px; text-align: center; }
-        footer { text-align: center; color: white; margin-top: 30px; padding: 20px; }
-        .balance-positive { color: #4CAF50; }
-        .balance-negative { color: #f44336; }
-        .esp-status { margin-top: 10px; font-size: 13px; }
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:'Segoe UI',Tahoma,sans-serif;background:linear-gradient(135deg,#1a1a2e,#16213e);min-height:100vh;padding:20px}
+        .container{max-width:1600px;margin:0 auto}
+        header{text-align:center;color:white;margin-bottom:30px}
+        h1{font-size:2.5em;margin-bottom:10px}
+        .subtitle{font-size:1.1em;opacity:.9}
+        .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:25px;margin-bottom:25px}
+        .card{background:white;border-radius:20px;padding:25px;box-shadow:0 10px 40px rgba(0,0,0,.2);transition:transform .3s}
+        .card:hover{transform:translateY(-5px)}
+        .card-header{font-size:1.3em;font-weight:bold;color:#1a1a2e;margin-bottom:20px;border-bottom:3px solid #1a1a2e;padding-bottom:12px}
+        .value{font-size:2.2em;font-weight:bold;color:#333;margin:10px 0}
+        .unit{font-size:.5em;color:#666}
+        .status{padding:8px 15px;border-radius:8px;display:inline-block;font-weight:bold}
+        .status-normal{background:#4CAF50;color:white}
+        .status-overload{background:#ff9800;color:white}
+        .status-tripped{background:#f44336;color:white;animation:blink 1s infinite}
+        @keyframes blink{0%,100%{opacity:1}50%{opacity:.5}}
+        .prediction-card{background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:15px;border-radius:12px;margin:10px 0}
+        .chart-container{margin:20px 0;height:500px}
+        .recommendation{background:#e3f2fd;padding:12px;border-radius:10px;margin:10px 0;border-left:4px solid #2196F3}
+        .peak-hour{display:inline-block;background:#ff9800;color:white;padding:6px 12px;border-radius:8px;margin:5px;font-size:13px}
+        .load-badge{display:inline-block;padding:4px 10px;border-radius:20px;margin:3px;font-size:12px;font-weight:bold}
+        .load-on{background:#4CAF50;color:white}
+        .load-off{background:#9e9e9e;color:white}
+        .relay-btn{display:inline-block;padding:8px 20px;border:none;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;margin:5px;transition:all .2s}
+        .relay-btn-on{background:#4CAF50;color:white}
+        .relay-btn-on:hover{background:#388E3C}
+        .relay-btn-off{background:#f44336;color:white}
+        .relay-btn-off:hover{background:#d32f2f}
+        .relay-btn:disabled{background:#ccc;cursor:not-allowed}
+        .timestamp{font-size:.8em;color:#666;margin-top:20px;text-align:center}
+        footer{text-align:center;color:white;margin-top:30px;padding:20px}
+        .balance-positive{color:#4CAF50}
+        .balance-negative{color:#f44336}
+        .esp-status{margin-top:10px;font-size:13px}
+        .shedding-active{background:#f44336;color:white;padding:10px;border-radius:8px;margin:10px 0;font-weight:bold}
+        .shedding-normal{background:#4CAF50;color:white;padding:10px;border-radius:8px;margin:10px 0}
+        .export-btn{display:inline-block;padding:10px 20px;border:none;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;margin:5px;color:white;transition:all .2s}
+        .export-csv{background:#2196F3}.export-csv:hover{background:#1976D2}
+        .export-excel{background:#4CAF50}.export-excel:hover{background:#388E3C}
+        .export-pdf{background:#f44336}.export-pdf:hover{background:#d32f2f}
+        .config-input{width:60px;padding:5px;border:1px solid #ccc;border-radius:4px;margin:5px}
+        .config-label{font-size:13px;color:#666}
     </style>
 </head>
 <body>
@@ -564,7 +811,6 @@ HTML_TEMPLATE = """
                 <div class="value" id="battery-current">0<span class="unit">A</span></div>
                 <div>Battery Current</div>
             </div>
-
             <div class="card">
                 <div class="card-header">Power Dashboard</div>
                 <div class="value" id="load-power">0<span class="unit">W</span></div>
@@ -572,30 +818,29 @@ HTML_TEMPLATE = """
                 <div class="value" id="inverter-power">0<span class="unit">W</span></div>
                 <div>Inverter Power (Produced)</div>
                 <div class="value" id="power-balance">0<span class="unit">W</span></div>
-                <div>Power Balance (Produced - Consumed)</div>
-                <div id="trip-status" class="status status-normal" style="margin-top: 10px;">NORMAL</div>
+                <div>Power Balance</div>
+                <div id="trip-status" class="status status-normal" style="margin-top:10px">NORMAL</div>
             </div>
-
             <div class="card">
                 <div class="card-header">Load Status & Control</div>
                 <div class="value" id="load-current">0<span class="unit">A</span></div>
                 <div>Total Load Current</div>
-                <div style="margin: 15px 0;">
+                <div style="margin:15px 0">
                     <span class="load-badge load-off" id="load1-badge">Load 1: OFF</span>
                     <span class="load-badge load-off" id="load2-badge">Load 2: OFF</span>
                 </div>
-                <div id="load-powers" style="font-size: 14px; color: #666;"></div>
-                <div class="card-header" style="margin-top: 15px; border-bottom: 2px solid #2196F3;">Relay Control</div>
-                <div style="margin: 10px 0;">
-                    <div style="margin-bottom: 10px;">
-                        <strong>Relay 1 (Load 1):</strong>
-                        <button class="relay-btn relay-btn-on" id="r1-on" onclick="sendRelayCmd(1, 'ON')">ON</button>
-                        <button class="relay-btn relay-btn-off" id="r1-off" onclick="sendRelayCmd(1, 'OFF')">OFF</button>
+                <div id="load-powers" style="font-size:14px;color:#666"></div>
+                <div class="card-header" style="margin-top:15px;border-bottom:2px solid #2196F3">Relay Control</div>
+                <div style="margin:10px 0">
+                    <div style="margin-bottom:10px">
+                        <strong>Relay 1 (Essential):</strong>
+                        <button class="relay-btn relay-btn-on" onclick="sendRelayCmd(1,'ON')">ON</button>
+                        <button class="relay-btn relay-btn-off" onclick="sendRelayCmd(1,'OFF')">OFF</button>
                     </div>
                     <div>
-                        <strong>Relay 2 (Load 2):</strong>
-                        <button class="relay-btn relay-btn-on" id="r2-on" onclick="sendRelayCmd(2, 'ON')">ON</button>
-                        <button class="relay-btn relay-btn-off" id="r2-off" onclick="sendRelayCmd(2, 'OFF')">OFF</button>
+                        <strong>Relay 2 (Priority):</strong>
+                        <button class="relay-btn relay-btn-on" onclick="sendRelayCmd(2,'ON')">ON</button>
+                        <button class="relay-btn relay-btn-off" onclick="sendRelayCmd(2,'OFF')">OFF</button>
                     </div>
                 </div>
                 <div class="value" id="energy-consumed">0.000000<span class="unit">kWh</span></div>
@@ -607,300 +852,205 @@ HTML_TEMPLATE = """
 
         <div class="grid">
             <div class="card">
-                <div class="card-header">Power Comparison (Real-time)</div>
-                <div class="chart-container">
-                    <canvas id="powerChart"></canvas>
+                <div class="card-header">Load Shedding Status</div>
+                <div id="shedding-status"></div>
+                <div style="margin-top:15px">
+                    <div class="config-label">Critical SOC Threshold: <input type="number" id="cfg-critical" class="config-input" value="20" min="5" max="50">% </div>
+                    <div class="config-label">Warning SOC Threshold: <input type="number" id="cfg-warning" class="config-input" value="30" min="10" max="60">%</div>
+                    <button class="relay-btn relay-btn-on" onclick="updateSheddingConfig()" style="margin-top:10px">Update Thresholds</button>
                 </div>
             </div>
-
+            <div class="card">
+                <div class="card-header">Export & Reports</div>
+                <div style="margin:10px 0">
+                    <div class="config-label" style="margin-bottom:5px">Date Range:</div>
+                    <input type="date" id="export-start" style="padding:5px;border:1px solid #ccc;border-radius:4px">
+                    <span style="margin:0 5px">to</span>
+                    <input type="date" id="export-end" style="padding:5px;border:1px solid #ccc;border-radius:4px">
+                </div>
+                <div style="margin-top:15px">
+                    <button class="export-btn export-csv" onclick="exportCSV()">Export CSV</button>
+                    <button class="export-btn export-excel" onclick="exportExcel()">Export Excel</button>
+                </div>
+                <div style="margin-top:15px">
+                    <div class="config-label" style="margin-bottom:5px">Monthly PDF Report:</div>
+                    <select id="report-month" style="padding:5px;border:1px solid #ccc;border-radius:4px">
+                        <option value="1">January</option><option value="2">February</option><option value="3">March</option>
+                        <option value="4">April</option><option value="5">May</option><option value="6">June</option>
+                        <option value="7">July</option><option value="8">August</option><option value="9">September</option>
+                        <option value="10">October</option><option value="11">November</option><option value="12">December</option>
+                    </select>
+                    <input type="number" id="report-year" value="2026" style="width:70px;padding:5px;border:1px solid #ccc;border-radius:4px">
+                    <button class="export-btn export-pdf" onclick="exportPDF()">Download PDF</button>
+                </div>
+            </div>
             <div class="card">
                 <div class="card-header">Energy Predictions</div>
-                <div class="prediction-card">
-                    <div>Today's Predicted Energy</div>
-                    <div class="value" id="pred-today">0<span class="unit">kWh</span></div>
-                </div>
-                <div class="prediction-card">
-                    <div>Tomorrow's Predicted Energy</div>
-                    <div class="value" id="pred-tomorrow">0<span class="unit">kWh</span></div>
-                </div>
-                <div class="prediction-card">
-                    <div>Weekly Predicted Energy</div>
-                    <div class="value" id="pred-weekly">0<span class="unit">kWh</span></div>
-                </div>
-                <div class="card-header" style="margin-top: 15px;">Peak Usage Hours</div>
+                <div class="prediction-card"><div>Today's Predicted Energy</div><div class="value" id="pred-today">0<span class="unit">kWh</span></div></div>
+                <div class="prediction-card"><div>Tomorrow's Predicted Energy</div><div class="value" id="pred-tomorrow">0<span class="unit">kWh</span></div></div>
+                <div class="prediction-card"><div>Weekly Predicted Energy</div><div class="value" id="pred-weekly">0<span class="unit">kWh</span></div></div>
+                <div class="card-header" style="margin-top:15px">Peak Usage Hours</div>
                 <div id="peak-hours"></div>
             </div>
         </div>
 
         <div class="grid">
             <div class="card">
-                <div class="card-header">Historical Power Trends (2 Months)</div>
-                <div class="chart-container">
-                    <div id="historicalChart"></div>
-                </div>
+                <div class="card-header">Real-time Power Comparison</div>
+                <div class="chart-container"><canvas id="powerChart"></canvas></div>
             </div>
+            <div class="card">
+                <div class="card-header">Monthly Comparison (This vs Last)</div>
+                <div id="comparisonChart" style="height:500px"></div>
+            </div>
+        </div>
 
+        <div class="grid">
+            <div class="card">
+                <div class="card-header">Historical Power Trends</div>
+                <div id="historicalChart" style="height:450px"></div>
+            </div>
             <div class="card">
                 <div class="card-header">Energy Recommendations</div>
                 <div id="recommendations"></div>
-                <div class="card-header" style="margin-top: 15px;">Weather</div>
+                <div class="card-header" style="margin-top:15px">Weather</div>
                 <div id="weather-info"></div>
                 <div id="sunlight-info"></div>
             </div>
         </div>
 
         <div id="timestamp" class="timestamp">Last Update: --</div>
-        <footer>
-            <p>Copperbelt University, Kitwe, Zambia | Real-time ESP32 Data | Updates every second</p>
-        </footer>
+        <footer><p>Copperbelt University, Kitwe, Zambia | Real-time ESP32 Data | Updates every second</p></footer>
     </div>
 
     <script>
         let powerChart;
-
-        function initChart() {
-            const ctx = document.getElementById('powerChart').getContext('2d');
-            powerChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: [],
-                    datasets: [
-                        {
-                            label: 'Power Consumed (W)',
-                            data: [],
-                            borderColor: '#f44336',
-                            backgroundColor: 'rgba(244, 67, 54, 0.1)',
-                            borderWidth: 3,
-                            tension: 0.4,
-                            fill: true
-                        },
-                        {
-                            label: 'Power Produced (W)',
-                            data: [],
-                            borderColor: '#4CAF50',
-                            backgroundColor: 'rgba(76, 175, 80, 0.1)',
-                            borderWidth: 3,
-                            tension: 0.4,
-                            fill: true
-                        }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: { position: 'top', labels: { font: { size: 14 } } },
-                        title: { display: true, text: 'Last 60 Seconds - Real-time', font: { size: 16 } }
-                    },
-                    scales: {
-                        y: {
-                            beginAtZero: true,
-                            title: { display: true, text: 'Power (Watts)', font: { size: 14 } },
-                            grid: { color: '#ddd' }
-                        },
-                        x: {
-                            title: { display: true, text: 'Time', font: { size: 14 } }
-                        }
-                    }
+        function initChart(){
+            const ctx=document.getElementById('powerChart').getContext('2d');
+            powerChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[
+                {label:'Consumed (W)',data:[],borderColor:'#f44336',backgroundColor:'rgba(244,67,54,.1)',borderWidth:3,tension:.4,fill:true},
+                {label:'Produced (W)',data:[],borderColor:'#4CAF50',backgroundColor:'rgba(76,175,80,.1)',borderWidth:3,tension:.4,fill:true}
+            ]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top'},title:{display:true,text:'Last 60 Seconds'}},scales:{y:{beginAtZero:true,title:{display:true,text:'Watts'}},x:{title:{display:true,text:'Time'}}}}});
+        }
+        function sendRelayCmd(r,s){fetch('/api/relay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:r,state:s})}).then(r=>r.json()).then(d=>console.log(d)).catch(e=>console.error(e));}
+        function updateSheddingConfig(){
+            fetch('/api/load_shedding',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({soc_critical:parseFloat(document.getElementById('cfg-critical').value),soc_warning:parseFloat(document.getElementById('cfg-warning').value)})}).then(r=>r.json()).then(d=>alert('Updated: '+JSON.stringify(d.config))).catch(e=>alert('Error: '+e));
+        }
+        function exportCSV(){
+            const s=document.getElementById('export-start').value||new Date(Date.now()-30*86400000).toISOString().slice(0,10);
+            const e=document.getElementById('export-end').value||new Date().toISOString().slice(0,10);
+            window.location='/api/export/csv?start='+s+'&end='+e+' 23:59:59';
+        }
+        function exportExcel(){
+            const s=document.getElementById('export-start').value||new Date(Date.now()-30*86400000).toISOString().slice(0,10);
+            const e=document.getElementById('export-end').value||new Date().toISOString().slice(0,10);
+            window.location='/api/export/excel?start='+s+'&end='+e+' 23:59:59';
+        }
+        function exportPDF(){
+            const m=document.getElementById('report-month').value;
+            const y=document.getElementById('report-year').value;
+            window.location='/api/report/monthly?month='+m+'&year='+y;
+        }
+        function fetchData(){
+            fetch('/api/data').then(r=>r.json()).then(d=>{
+                document.getElementById('battery-soc').innerHTML=d.battery_soc.toFixed(1)+'<span class="unit">%</span>';
+                document.getElementById('battery-voltage').innerHTML=d.battery_voltage.toFixed(1)+'<span class="unit">V</span>';
+                document.getElementById('battery-current').innerHTML=d.battery_current.toFixed(2)+'<span class="unit">A</span>';
+                document.getElementById('load-power').innerHTML=d.load_power.toFixed(1)+'<span class="unit">W</span>';
+                document.getElementById('inverter-power').innerHTML=d.inverter_power.toFixed(1)+'<span class="unit">W</span>';
+                document.getElementById('load-current').innerHTML=d.load_current.toFixed(2)+'<span class="unit">A</span>';
+                document.getElementById('energy-consumed').innerHTML=d.energy_consumed_kwh.toFixed(6)+'<span class="unit">kWh</span>';
+                document.getElementById('energy-produced').innerHTML=d.energy_produced_kwh.toFixed(6)+'<span class="unit">kWh</span>';
+                const b=document.getElementById('power-balance');
+                b.innerHTML=d.power_balance.toFixed(1)+'<span class="unit">W</span>';
+                b.className='value '+(d.power_balance>=0?'balance-positive':'balance-negative');
+                document.getElementById('load1-badge').innerHTML='Load 1: '+d.load1_state;
+                document.getElementById('load2-badge').innerHTML='Load 2: '+d.load2_state;
+                document.getElementById('load1-badge').className='load-badge '+(d.load1_state==='ON'?'load-on':'load-off');
+                document.getElementById('load2-badge').className='load-badge '+(d.load2_state==='ON'?'load-on':'load-off');
+                document.getElementById('load-powers').innerHTML='L1: '+(d.load1_power||0).toFixed(0)+'W | L2: '+(d.load2_power||0).toFixed(0)+'W';
+                const t=document.getElementById('trip-status');
+                t.textContent=d.trip_state==='OVL'?'OVERLOAD':d.trip_state==='NOR'?'NORMAL':d.trip_state;
+                t.className='status '+(d.trip_state==='OVL'?'status-overload':d.trip_state==='NOR'?'status-normal':'status-tripped');
+                const e=document.getElementById('esp-status');
+                e.innerHTML=d.esp32_online?'<span style="color:#4CAF50;font-weight:bold">ESP32 ONLINE</span> | '+d.last_esp32_seen:'<span style="color:#f44336;font-weight:bold">ESP32 OFFLINE</span>';
+                const sh=document.getElementById('shedding-status');
+                if(d.load_shedding_active){sh.innerHTML='<div class="shedding-active">LOAD SHEDDING ACTIVE - Relay(s) '+d.shed_relays+' OFF (Low Battery)</div>';}
+                else{sh.innerHTML='<div class="shedding-normal">Auto-Shedding: Standby (Threshold: '+document.getElementById('cfg-critical').value+'%)</div>';}
+                if(d.predictions){
+                    document.getElementById('pred-today').innerHTML=d.predictions.today_energy+'<span class="unit">kWh</span>';
+                    document.getElementById('pred-tomorrow').innerHTML=d.predictions.tomorrow_energy+'<span class="unit">kWh</span>';
+                    document.getElementById('pred-weekly').innerHTML=d.predictions.weekly_energy+'<span class="unit">kWh</span>';
+                    const p=document.getElementById('peak-hours');
+                    if(p&&d.predictions.peak_hours)p.innerHTML=d.predictions.peak_hours.map(x=>'<div class="peak-hour">'+x.hour+' ('+x.factor+'x)</div>').join('');
                 }
-            });
+                if(d.recommendations)document.getElementById('recommendations').innerHTML=d.recommendations.map(r=>'<div class="recommendation">'+r+'</div>').join('');
+                if(d.weather&&d.weather.daily&&d.weather.daily.length>0){const w=d.weather.daily[0];document.getElementById('weather-info').innerHTML='<div>Temp: '+w.temp_max+'C/'+w.temp_min+'C</div><div>Condition: '+d.weather.current.condition+'</div>';}
+                if(d.sunlight)document.getElementById('sunlight-info').innerHTML='<div>Sunrise: '+d.sunlight.sunrise+'</div><div>Sunset: '+d.sunlight.sunset+'</div><div>UV: '+d.sunlight.uv_index+'</div>';
+                document.getElementById('timestamp').innerHTML='Last Update: '+d.timestamp;
+            }).catch(e=>console.error(e));
         }
-
-        function sendRelayCmd(relay, state) {
-            fetch('/api/relay', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ relay: relay, state: state })
-            })
-            .then(r => r.json())
-            .then(data => {
-                console.log('Relay command sent:', data);
-            })
-            .catch(err => console.error('Relay command failed:', err));
+        function fetchRealTimePower(){
+            fetch('/api/real_time_power').then(r=>r.json()).then(d=>{
+                if(powerChart&&d.consumed&&d.produced){
+                    powerChart.data.labels=d.timestamps.slice(-30);
+                    powerChart.data.datasets[0].data=d.consumed.slice(-30);
+                    powerChart.data.datasets[1].data=d.produced.slice(-30);
+                    powerChart.update();
+                }
+            }).catch(e=>console.error(e));
         }
-
-        function fetchData() {
-            fetch('/api/data')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('battery-soc').innerHTML = data.battery_soc.toFixed(1) + '<span class="unit">%</span>';
-                    document.getElementById('battery-voltage').innerHTML = data.battery_voltage.toFixed(1) + '<span class="unit">V</span>';
-                    document.getElementById('battery-current').innerHTML = data.battery_current.toFixed(2) + '<span class="unit">A</span>';
-                    document.getElementById('load-power').innerHTML = data.load_power.toFixed(1) + '<span class="unit">W</span>';
-                    document.getElementById('inverter-power').innerHTML = data.inverter_power.toFixed(1) + '<span class="unit">W</span>';
-                    document.getElementById('load-current').innerHTML = data.load_current.toFixed(2) + '<span class="unit">A</span>';
-
-                    document.getElementById('energy-consumed').innerHTML = data.energy_consumed_kwh.toFixed(6) + '<span class="unit">kWh</span>';
-                    document.getElementById('energy-produced').innerHTML = data.energy_produced_kwh.toFixed(6) + '<span class="unit">kWh</span>';
-
-                    const balanceElement = document.getElementById('power-balance');
-                    const balance = data.power_balance;
-                    balanceElement.innerHTML = balance.toFixed(1) + '<span class="unit">W</span>';
-                    balanceElement.className = 'value ' + (balance >= 0 ? 'balance-positive' : 'balance-negative');
-
-                    document.getElementById('load1-badge').innerHTML = 'Load 1: ' + data.load1_state;
-                    document.getElementById('load2-badge').innerHTML = 'Load 2: ' + data.load2_state;
-                    document.getElementById('load1-badge').className = 'load-badge ' + (data.load1_state === 'ON' ? 'load-on' : 'load-off');
-                    document.getElementById('load2-badge').className = 'load-badge ' + (data.load2_state === 'ON' ? 'load-on' : 'load-off');
-
-                    document.getElementById('load-powers').innerHTML = 'L1: ' + (data.load1_power?.toFixed(0) || 0) + 'W | L2: ' + (data.load2_power?.toFixed(0) || 0) + 'W';
-
-                    const tripElement = document.getElementById('trip-status');
-                    tripElement.textContent = data.trip_state;
-                    if (data.trip_state === 'OVL') {
-                        tripElement.className = 'status status-overload';
-                        tripElement.textContent = 'OVERLOAD';
-                    } else if (data.trip_state === 'NOR') {
-                        tripElement.className = 'status status-normal';
-                        tripElement.textContent = 'NORMAL';
-                    } else {
-                        tripElement.className = 'status status-tripped';
-                    }
-
-                    const espEl = document.getElementById('esp-status');
-                    if (data.esp32_online) {
-                        espEl.innerHTML = '<span style="color:#4CAF50;font-weight:bold;">ESP32 ONLINE</span> | Last seen: ' + data.last_esp32_seen;
-                    } else {
-                        espEl.innerHTML = '<span style="color:#f44336;font-weight:bold;">ESP32 OFFLINE</span> | Waiting for data...';
-                    }
-
-                    if (data.predictions) {
-                        document.getElementById('pred-today').innerHTML = data.predictions.today_energy + '<span class="unit">kWh</span>';
-                        document.getElementById('pred-tomorrow').innerHTML = data.predictions.tomorrow_energy + '<span class="unit">kWh</span>';
-                        document.getElementById('pred-weekly').innerHTML = data.predictions.weekly_energy + '<span class="unit">kWh</span>';
-                        const peakContainer = document.getElementById('peak-hours');
-                        if (peakContainer && data.predictions.peak_hours) {
-                            peakContainer.innerHTML = data.predictions.peak_hours.map(peak =>
-                                '<div class="peak-hour">' + peak.hour + ' (' + peak.factor + 'x) - ' + peak.reason + '</div>'
-                            ).join('');
-                        }
-                    }
-
-                    if (data.recommendations) {
-                        document.getElementById('recommendations').innerHTML = data.recommendations.map(rec =>
-                            '<div class="recommendation">' + rec + '</div>'
-                        ).join('');
-                    }
-
-                    if (data.weather && data.weather.daily && data.weather.daily.length > 0) {
-                        const today = data.weather.daily[0];
-                        document.getElementById('weather-info').innerHTML =
-                            '<div style="margin: 10px 0;">' +
-                            '<div>Temperature: ' + today.temp_max + 'C / ' + today.temp_min + 'C</div>' +
-                            '<div>Condition: ' + data.weather.current.condition + '</div>' +
-                            '</div>';
-                    }
-
-                    if (data.sunlight) {
-                        document.getElementById('sunlight-info').innerHTML =
-                            '<div>Sunrise: ' + data.sunlight.sunrise + '</div>' +
-                            '<div>Sunset: ' + data.sunlight.sunset + '</div>' +
-                            '<div>UV Index: ' + data.sunlight.uv_index + '</div>';
-                    }
-
-                    document.getElementById('timestamp').innerHTML = 'Last Update: ' + data.timestamp;
-                })
-                .catch(error => console.error('Fetch error:', error));
+        function loadHistoricalChart(){
+            fetch('/api/historical_data').then(r=>r.json()).then(d=>{
+                Plotly.newPlot('historicalChart',[
+                    {x:d.timestamps,y:d.consumed,name:'Consumed (W)',type:'scatter',mode:'lines',line:{color:'#f44336',width:3}},
+                    {x:d.timestamps,y:d.produced,name:'Produced (W)',type:'scatter',mode:'lines',line:{color:'#4CAF50',width:3}}
+                ],{title:'2-Month Power History',xaxis:{title:'Date',tickangle:-45},yaxis:{title:'Power (W)'},height:420,hovermode:'closest'},{responsive:true});
+            }).catch(e=>console.error(e));
         }
-
-        function fetchRealTimePower() {
-            fetch('/api/real_time_power')
-                .then(response => response.json())
-                .then(data => {
-                    if (powerChart && data.consumed && data.produced) {
-                        const labels = data.timestamps.map((t, i) => t);
-                        powerChart.data.labels = labels.slice(-30);
-                        powerChart.data.datasets[0].data = data.consumed.slice(-30);
-                        powerChart.data.datasets[1].data = data.produced.slice(-30);
-                        powerChart.update();
-                    }
-                })
-                .catch(error => console.error('Error:', error));
+        function loadComparisonChart(){
+            fetch('/api/comparison').then(r=>r.json()).then(d=>{
+                const traces=[];
+                if(d.last_month&&d.last_month.dates.length>0){
+                    traces.push({x:d.last_month.dates,y:d.last_month.consumed,name:d.last_month_label+' Consumed',type:'scatter',mode:'lines',line:{color:'#ff9800',width:2,dash:'dash'}});
+                    traces.push({x:d.last_month.dates,y:d.last_month.produced,name:d.last_month_label+' Produced',type:'scatter',mode:'lines',line:{color:'#9e9e9e',width:2,dash:'dash'}});
+                }
+                if(d.this_month&&d.this_month.dates.length>0){
+                    traces.push({x:d.this_month.dates,y:d.this_month.consumed,name:d.this_month_label+' Consumed',type:'scatter',mode:'lines',line:{color:'#f44336',width:3}});
+                    traces.push({x:d.this_month.dates,y:d.this_month.produced,name:d.this_month_label+' Produced',type:'scatter',mode:'lines',line:{color:'#4CAF50',width:3}});
+                }
+                Plotly.newPlot('comparisonChart',traces,{title:'This Month vs Last Month',xaxis:{title:'Date'},yaxis:{title:'Power (W)'},height:450,hovermode:'closest'},{responsive:true});
+            }).catch(e=>console.error(e));
         }
-
-        function loadHistoricalChart() {
-            fetch('/api/historical_data')
-                .then(response => response.json())
-                .then(data => {
-                    const trace1 = {
-                        x: data.timestamps, y: data.consumed,
-                        name: 'Power Consumed (W)', type: 'scatter', mode: 'lines',
-                        line: { color: '#f44336', width: 3 }
-                    };
-                    const trace2 = {
-                        x: data.timestamps, y: data.produced,
-                        name: 'Power Produced (W)', type: 'scatter', mode: 'lines',
-                        line: { color: '#4CAF50', width: 3 }
-                    };
-                    const layout = {
-                        title: '2-Month Power History (Daily Average)',
-                        xaxis: { title: 'Date', tickangle: -45 },
-                        yaxis: { title: 'Power (Watts)' },
-                        height: 450, hovermode: 'closest',
-                        legend: { x: 0, y: 1, bgcolor: 'rgba(255,255,255,0.8)' }
-                    };
-                    Plotly.newPlot('historicalChart', [trace1, trace2], layout, { responsive: true });
-                })
-                .catch(error => console.error('Error:', error));
-        }
-
-        initChart();
-        fetchData();
-        fetchRealTimePower();
-        loadHistoricalChart();
-        setInterval(fetchData, 1000);
-        setInterval(fetchRealTimePower, 2000);
+        const d=new Date();document.getElementById('export-start').value=new Date(d-30*86400000).toISOString().slice(0,10);document.getElementById('export-end').value=d.toISOString().slice(0,10);document.getElementById('report-month').value=d.getMonth()+1;
+        initChart();fetchData();fetchRealTimePower();loadHistoricalChart();loadComparisonChart();
+        setInterval(fetchData,1000);setInterval(fetchRealTimePower,2000);setInterval(loadComparisonChart,60000);
     </script>
 </body>
-</html>
-"""
+</html>"""
 
 # ========== MAIN ==========
 if __name__ == '__main__':
     print("=" * 70)
     print("SOLAR MICROGRID ENERGY MANAGEMENT SYSTEM")
     print("=" * 70)
-    print("Endpoints:")
-    print("  POST /api/data      - ESP32 sends sensor data")
-    print("  GET  /api/commands  - ESP32 polls for commands")
-    print("  POST /api/relay     - Dashboard sends relay commands")
-    print("  POST /api/relay/ack - ESP32 confirms relay execution")
-    print("  GET  /api/data      - Dashboard reads all data")
-    print("=" * 70)
-    print(f"Location: Copperbelt University, Kitwe, Zambia")
-    print(f"Dashboard: http://localhost:5000")
-    print("=" * 70)
-
+    init_db()
     if not os.path.exists(HISTORICAL_DATA_FILE):
         init_historical_data()
     else:
-        print("Loading existing historical data...")
+        print("Loading historical data...")
         try:
             df = pd.read_csv(HISTORICAL_DATA_FILE)
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             for _, row in df.iterrows():
-                historical_power.append({
-                    'timestamp': row['timestamp'],
-                    'consumed': row['consumed_power'],
-                    'produced': row['produced_power']
-                })
-            print(f"Loaded {len(historical_power)} historical records")
+                historical_power.append({'timestamp': row['timestamp'], 'consumed': row['consumed_power'], 'produced': row['produced_power']})
+            print(f"Loaded {len(historical_power)} records")
         except Exception as e:
-            print(f"Error loading historical data: {e}")
+            print(f"Error: {e}")
             init_historical_data()
-
     get_weather_data()
-
-    weather_thread = threading.Thread(target=update_weather_periodically, daemon=True)
-    weather_thread.start()
-
-    esp32_check_thread = threading.Thread(target=check_esp32_status, daemon=True)
-    esp32_check_thread.start()
-
+    threading.Thread(target=update_weather_periodically, daemon=True).start()
+    threading.Thread(target=check_esp32_status, daemon=True).start()
     time.sleep(2)
-    print("\nSystem Ready!")
-    print("Open browser: http://localhost:5000\n")
-    print("ESP32 should POST sensor data to: /api/data")
-    print("ESP32 should poll commands from: /api/commands")
-
+    print("\nSystem Ready! Dashboard: http://localhost:5000")
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)

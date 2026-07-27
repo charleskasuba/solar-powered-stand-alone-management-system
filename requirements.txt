@@ -4,3 +4,5 @@ requests
 pandas
 numpy
 gunicorn
+reportlab
+openpyxl
