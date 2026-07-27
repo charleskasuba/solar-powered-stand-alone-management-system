@@ -19,13 +19,8 @@ const int RELAY2_PIN = 4;
 
 const float BATTERY_CAPACITY_AH = 70.0;
 
-// --- Auto-Load Shedding Config ---
-const float SOC_WARNING_THRESHOLD = 30.0;
-const float SOC_CRITICAL_THRESHOLD = 20.0;
-bool shedRelay2 = false;
-
 // --- Sensors & Hardware ---
-LiquidCrystal_I2C lcd(0x27, 20, 4); 
+LiquidCrystal_I2C lcd(0x27, 20, 4);
 Adafruit_INA219 ina219;
 
 // Serial2 for Primary Inverter PZEM: RX=25, TX=26
@@ -55,26 +50,10 @@ int failCount = 0;
 const unsigned long SEND_INTERVAL = 5000;
 const unsigned long LCD_INTERVAL = 4000;
 
-// Calculate State of Charge based on Lead-Acid 12V voltage curve
 float calculateBatterySoC(float voltage) {
   if (voltage >= 12.70) return 100.0;
   if (voltage <= 10.50) return 0.0;
   return constrain(((voltage - 10.50) / (12.70 - 10.50)) * 100.0, 0.0, 100.0);
-}
-
-// ========== Auto-Load Shedding ==========
-void handleLoadShedding() {
-  if (!shedRelay2 && batt_soc < SOC_CRITICAL_THRESHOLD) {
-    digitalWrite(RELAY2_PIN, RELAY_OFF);
-    shedRelay2 = true;
-    relay2State = false;
-    Serial.printf("[SHEDDING] Relay 2 OFF - Battery critical (SoC: %.1f%% < %.1f%%)\n", batt_soc, SOC_CRITICAL_THRESHOLD);
-  } else if (shedRelay2 && batt_soc > (SOC_CRITICAL_THRESHOLD + 5.0)) {
-    digitalWrite(RELAY2_PIN, RELAY_ON);
-    shedRelay2 = false;
-    relay2State = true;
-    Serial.printf("[SHEDDING] Relay 2 ON - Battery recovered (SoC: %.1f%% > %.1f%%)\n", batt_soc, SOC_CRITICAL_THRESHOLD + 5.0);
-  }
 }
 
 // ========== Send Sensor Data via HTTP GET ==========
@@ -102,7 +81,6 @@ void sendSensorData() {
   url += "&ba=" + String(BATTERY_CAPACITY_AH, 0);
   url += "&r1=" + String(relay1State ? "ON" : "OFF");
   url += "&r2=" + String(relay2State ? "ON" : "OFF");
-  url += "&sh=" + String(shedRelay2 ? "1" : "0");
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -155,9 +133,6 @@ void pollCommands() {
       } else if (relay == 2) {
         digitalWrite(RELAY2_PIN, turnOn ? RELAY_ON : RELAY_OFF);
         relay2State = turnOn;
-        if (!turnOn) {
-          shedRelay2 = false;
-        }
         Serial.printf(">> Relay 2 commanded -> %s\n", turnOn ? "ON" : "OFF");
       }
     }
@@ -173,33 +148,33 @@ void updateLCDScreen() {
   switch (displayPage) {
     case 0:
       lcd.setCursor(0, 0); lcd.print("--- INVERTER OUT ---");
-      snprintf(buf, sizeof(buf), "V:%5.1fV  I:%5.2fA", p_voltage, p_current); 
+      snprintf(buf, sizeof(buf), "V:%5.1fV  I:%5.2fA", p_voltage, p_current);
       lcd.setCursor(0, 1); lcd.print(buf);
-      snprintf(buf, sizeof(buf), "P:%5.1fW PF:%4.2f", p_power, p_pf); 
+      snprintf(buf, sizeof(buf), "P:%5.1fW PF:%4.2f", p_power, p_pf);
       lcd.setCursor(0, 2); lcd.print(buf);
-      snprintf(buf, sizeof(buf), "Sent:%d  OK:%d", sendCount, sendCount - failCount); 
+      snprintf(buf, sizeof(buf), "Sent:%d  OK:%d", sendCount, sendCount - failCount);
       lcd.setCursor(0, 3); lcd.print(buf);
       displayPage = 1;
       break;
 
     case 1:
       lcd.setCursor(0, 0); lcd.print("--- LOAD METRICS ---");
-      snprintf(buf, sizeof(buf), "V:%5.1fV  I:%5.2fA", l_voltage, l_current); 
+      snprintf(buf, sizeof(buf), "V:%5.1fV  I:%5.2fA", l_voltage, l_current);
       lcd.setCursor(0, 1); lcd.print(buf);
-      snprintf(buf, sizeof(buf), "P:%5.1fW PF:%4.2f", l_power, l_pf); 
+      snprintf(buf, sizeof(buf), "P:%5.1fW PF:%4.2f", l_power, l_pf);
       lcd.setCursor(0, 2); lcd.print(buf);
-      snprintf(buf, sizeof(buf), "Energy:%6.2fWh", l_energy); 
+      snprintf(buf, sizeof(buf), "Energy:%6.2fWh", l_energy);
       lcd.setCursor(0, 3); lcd.print(buf);
       displayPage = 2;
       break;
 
     case 2:
-      lcd.setCursor(0, 0); lcd.print("--- BATTERY METRICS -");
-      snprintf(buf, sizeof(buf), "V:%5.2fV  I:%5.2fA", batt_voltage, batt_current_A); 
+      lcd.setCursor(0, 0); lcd.print("--- BATTERY -------");
+      snprintf(buf, sizeof(buf), "V:%5.2fV  I:%5.2fA", batt_voltage, batt_current_A);
       lcd.setCursor(0, 1); lcd.print(buf);
-      snprintf(buf, sizeof(buf), "P:%5.1fW  SoC:%4.1f%%", batt_power_W, batt_soc); 
+      snprintf(buf, sizeof(buf), "P:%5.1fW  SoC:%4.1f%%", batt_power_W, batt_soc);
       lcd.setCursor(0, 2); lcd.print(buf);
-      snprintf(buf, sizeof(buf), "R1:%s R2:%s Shed:%s", relay1State ? "ON" : "OFF", relay2State ? "ON" : "OFF", shedRelay2 ? "1" : "0"); 
+      snprintf(buf, sizeof(buf), "R1:%s R2:%s", relay1State ? "ON" : "OFF", relay2State ? "ON" : "OFF");
       lcd.setCursor(0, 3); lcd.print(buf);
       displayPage = 0;
       break;
@@ -211,7 +186,6 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  // Initialize Relay GPIOs
   pinMode(RELAY1_PIN, OUTPUT);
   pinMode(RELAY2_PIN, OUTPUT);
   digitalWrite(RELAY1_PIN, RELAY_ON);
@@ -223,7 +197,6 @@ void setup() {
   Serial.println("  SOLAR MICROGRID - ESP32 CONTROLLER");
   Serial.println("==============================================");
 
-  // Initialize I2C and LCD Display
   Wire.begin(21, 22);
   lcd.init();
   lcd.backlight();
@@ -233,7 +206,6 @@ void setup() {
   lcd.setCursor(0, 1);
   lcd.print("Initializing WiFi...");
 
-  // Initialize INA219
   if (!ina219.begin()) {
     Serial.println("[WARN] INA219 not found on I2C bus!");
   } else {
@@ -241,11 +213,9 @@ void setup() {
     Serial.println("[OK] INA219 initialized!");
   }
 
-  // Initialize Hardware Serials for PZEMs
   pzemLoadSerial.begin(9600, SERIAL_8N1, 16, 17);
   Serial.println("[OK] PZEM Serial Ports initialized!");
 
-  // WiFi Connection Procedure
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   int attempts = 0;
@@ -286,7 +256,7 @@ void loop() {
     }
   }
 
-  // 2. Read Sensors, Shed Load & Transmit Data
+  // 2. Read Sensors & Transmit Data
   if (now - lastSend >= SEND_INTERVAL) {
     lastSend = now;
 
@@ -319,28 +289,30 @@ void loop() {
       l_voltage = 0; l_current = 0; l_power = 0; l_pf = 0;
     }
 
-    // --- Battery Voltage Lock & Variation (12.22V to 12.35V) ---
-    batt_voltage = 12.22 + (0.13 * (0.5 + 0.5 * sin(now / 5000.0)));
-    
-    // Read current from INA219, fallback to 1.45A if sensor is disconnected
+    // --- Read INA219 Battery Data ---
+    float busvoltage = ina219.getBusVoltage_V();
+    float shuntvoltage = ina219.getShuntVoltage_mV();
     float current_mA = ina219.getCurrent_mA();
-    batt_current_A = (isnan(current_mA) || abs(current_mA) < 10.0) ? 1.45 : (current_mA / 1000.0);
-    
-    batt_power_W = batt_voltage * batt_current_A;
-    batt_soc = calculateBatterySoC(batt_voltage);
+    float power_mW = ina219.getPower_mW();
 
-    // Auto-load shedding check (Will clear shedding since SoC > 78%)
-    handleLoadShedding();
+    if (isnan(busvoltage) || isinf(busvoltage) || busvoltage <= 0.0) {
+      batt_voltage = 0.0;
+      batt_current_A = 0.0;
+      batt_power_W = 0.0;
+      batt_soc = 0.0;
+    } else {
+      batt_voltage = busvoltage + (shuntvoltage / 1000.0);
+      batt_current_A = (isnan(current_mA) || isinf(current_mA)) ? 0.0 : (current_mA / 1000.0);
+      batt_power_W = (isnan(power_mW) || isinf(power_mW)) ? 0.0 : (power_mW / 1000.0);
+      batt_soc = calculateBatterySoC(batt_voltage);
+    }
 
-    // Console Diagnostic Output
+    // --- Console Diagnostic Output ---
     Serial.printf("\n--- Reading #%d (Fails: %d) ---\n", sendCount + 1, failCount);
     Serial.printf("Inv:  %.1fV | %.2fA | %.1fW | PF:%.2f\n", p_voltage, p_current, p_power, p_pf);
     Serial.printf("Load: %.1fV | %.2fA | %.1fW\n", l_voltage, l_current, l_power);
     Serial.printf("Batt: %.2fV | %.2fA | %.1fW | SoC:%.1f%%\n", batt_voltage, batt_current_A, batt_power_W, batt_soc);
-    Serial.printf("Relays: R1=%s R2=%s | Shedding: %s\n", 
-                  relay1State ? "ON" : "OFF", 
-                  relay2State ? "ON" : "OFF", 
-                  shedRelay2 ? "ACTIVE" : "inactive");
+    Serial.printf("Relays: R1=%s R2=%s\n", relay1State ? "ON" : "OFF", relay2State ? "ON" : "OFF");
 
     sendSensorData();
     pollCommands();
