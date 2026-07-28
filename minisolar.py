@@ -63,9 +63,9 @@ historical_power = []
 # ========== EMAIL NOTIFICATIONS ==========
 def send_email(subject, html_body):
     try:
-        url = "https://email.messagebird.com/v1/email"
+        url = "https://eu1.platform.bird.com/v1/email/messages"
         headers = {
-            "Authorization": f"AccessKey {BIRD_API_KEY}",
+            "Authorization": f"Bearer {BIRD_API_KEY}",
             "Content-Type": "application/json"
         }
         payload = {
@@ -75,11 +75,11 @@ def send_email(subject, html_body):
             "html": html_body
         }
         response = requests.post(url, json=payload, headers=headers, timeout=15)
-        if response.status_code in (200, 201):
+        if response.status_code in (200, 201, 202):
             print(f"Email sent: {subject}")
             return True
         else:
-            print(f"Email error {response.status_code}: {response.text[:200]}")
+            print(f"Email error {response.status_code}: {response.text[:300]}")
             return False
     except Exception as e:
         print(f"Email send error: {e}")
