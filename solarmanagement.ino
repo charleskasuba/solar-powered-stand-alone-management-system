@@ -6,37 +6,38 @@
 #include <LiquidCrystal_I2C.h>
 #include <Adafruit_INA219.h>
 
-// --- WiFi & Server ---
+// --- WiFi & Server Configuration ---
 const char* WIFI_SSID = "THE METHOD ZONE";
 const char* WIFI_PASS = "Chabu321+";
 const char* SERVER_URL = "https://solar-powered-stand-alone-management.onrender.com";
 
 // --- Hardware Pins ---
-const int RELAY1_PIN = 18;
-const int RELAY2_PIN = 4;
+const int RELAY1_PIN = 18; // IN1: Critical Load (Always ON)
+const int RELAY2_PIN = 16; // IN2: Non-Critical / Auxiliary Load
+
 #define RELAY_ON  LOW
 #define RELAY_OFF HIGH
 
 const float BATTERY_CAPACITY_AH = 70.0;
 
-// --- Sensors & Hardware ---
+// --- Display & Hardware Modules ---
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 Adafruit_INA219 ina219;
 
-// Serial2 for Primary Inverter PZEM: RX=25, TX=26
+// Primary Inverter PZEM (HardwareSerial 2: RX=25, TX=26)
 PZEM004Tv30 pzemPrimary(Serial2, 25, 26);
 
-// Serial1 for Dedicated Load PZEM: RX=16, TX=17
+// Load PZEM (HardwareSerial 1: Moved to RX=32, TX=33 to clear GPIO 16 for Relay 2)
 HardwareSerial pzemLoadSerial(1);
-PZEM004Tv30 pzemLoad(pzemLoadSerial, 16, 17);
+PZEM004Tv30 pzemLoad(pzemLoadSerial, 32, 33);
 
 // --- Metrics Variables ---
 float p_voltage = 0, p_current = 0, p_power = 0, p_energy = 0, p_pf = 0;
 float l_voltage = 0, l_current = 0, l_power = 0, l_energy = 0, l_pf = 0;
 float batt_voltage = 0, batt_current_A = 0, batt_power_W = 0, batt_soc = 0;
 
-// --- Relay State ---
-bool relay1State = true;
+// --- Relay States ---
+bool relay1State = true; // Critical Load: forced true
 bool relay2State = true;
 
 // --- Timing ---
@@ -50,6 +51,7 @@ int failCount = 0;
 const unsigned long SEND_INTERVAL = 5000;
 const unsigned long LCD_INTERVAL = 4000;
 
+// Lead-Acid State of Charge Approximation
 float calculateBatterySoC(float voltage) {
   if (voltage >= 12.70) return 100.0;
   if (voltage <= 10.50) return 0.0;
@@ -59,7 +61,7 @@ float calculateBatterySoC(float voltage) {
 // ========== Send Sensor Data via HTTP GET ==========
 void sendSensorData() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[HTTP] WiFi not connected, skipping send");
+    Serial.println("[HTTP] WiFi disconnect, skipping send.");
     return;
   }
 
@@ -102,7 +104,7 @@ void sendSensorData() {
   http.end();
 }
 
-// ========== Poll Commands ==========
+// ========== Poll Server Commands ==========
 void pollCommands() {
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -127,9 +129,10 @@ void pollCommands() {
       bool turnOn = resp.indexOf("\"state\":\"ON\"") >= 0;
 
       if (relay == 1) {
-        digitalWrite(RELAY1_PIN, turnOn ? RELAY_ON : RELAY_OFF);
-        relay1State = turnOn;
-        Serial.printf(">> Relay 1 commanded -> %s\n", turnOn ? "ON" : "OFF");
+        // ENFORCE CRITICAL LOAD PROTECTION: Always remain ON regardless of server command
+        digitalWrite(RELAY1_PIN, RELAY_ON);
+        relay1State = true;
+        Serial.println(">> Relay 1 override: Critical load forced ALWAYS ON");
       } else if (relay == 2) {
         digitalWrite(RELAY2_PIN, turnOn ? RELAY_ON : RELAY_OFF);
         relay2State = turnOn;
@@ -140,7 +143,7 @@ void pollCommands() {
   http.end();
 }
 
-// ========== LCD Refresh Screen Function ==========
+// ========== Refresh LCD Interface ==========
 void updateLCDScreen() {
   char buf[21];
   lcd.clear();
@@ -169,7 +172,7 @@ void updateLCDScreen() {
       break;
 
     case 2:
-      lcd.setCursor(0, 0); lcd.print("--- BATTERY -------");
+      lcd.setCursor(0, 0); lcd.print("--- BATTERY METRICS ---");
       snprintf(buf, sizeof(buf), "V:%5.2fV  I:%5.2fA", batt_voltage, batt_current_A);
       lcd.setCursor(0, 1); lcd.print(buf);
       snprintf(buf, sizeof(buf), "P:%5.1fW  SoC:%4.1f%%", batt_power_W, batt_soc);
@@ -186,17 +189,21 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  // Initialize Relays
   pinMode(RELAY1_PIN, OUTPUT);
   pinMode(RELAY2_PIN, OUTPUT);
-  digitalWrite(RELAY1_PIN, RELAY_ON);
-  digitalWrite(RELAY2_PIN, RELAY_ON);
+  
+  digitalWrite(RELAY1_PIN, RELAY_ON); // Lock IN1 ON for critical loads
+  digitalWrite(RELAY2_PIN, RELAY_ON); // Default IN2 ON
+  
   relay1State = true;
   relay2State = true;
 
   Serial.println("\n==============================================");
-  Serial.println("  SOLAR MICROGRID - ESP32 CONTROLLER");
+  Serial.println("   SOLAR MICROGRID - ESP32 CONTROLLER");
   Serial.println("==============================================");
 
+  // I2C & LCD Initialization
   Wire.begin(21, 22);
   lcd.init();
   lcd.backlight();
@@ -204,18 +211,21 @@ void setup() {
   lcd.setCursor(0, 0);
   lcd.print("System Booting...");
   lcd.setCursor(0, 1);
-  lcd.print("Initializing WiFi...");
+  lcd.print("Connecting WiFi...");
 
+  // INA219 Setup
   if (!ina219.begin()) {
-    Serial.println("[WARN] INA219 not found on I2C bus!");
+    Serial.println("[WARN] INA219 not detected on I2C!");
   } else {
     ina219.setCalibration_32V_2A();
-    Serial.println("[OK] INA219 initialized!");
+    Serial.println("[OK] INA219 Initialized");
   }
 
-  pzemLoadSerial.begin(9600, SERIAL_8N1, 16, 17);
-  Serial.println("[OK] PZEM Serial Ports initialized!");
+  // Load PZEM Serial Setup (GPIO 32 RX, GPIO 33 TX)
+  pzemLoadSerial.begin(9600, SERIAL_8N1, 32, 33);
+  Serial.println("[OK] PZEM Serial Interfaces Configured");
 
+  // WiFi Connection Procedure
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   int attempts = 0;
@@ -235,9 +245,9 @@ void setup() {
   } else {
     Serial.println("\n[FAIL] WiFi Connection Failed!");
     lcd.setCursor(0, 0);
-    lcd.print("WiFi Connection");
+    lcd.print("WiFi Failed!");
     lcd.setCursor(0, 1);
-    lcd.print("FAILED! Running offline");
+    lcd.print("Running Offline...");
   }
   delay(2000);
   lcd.clear();
@@ -247,7 +257,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 1. Non-blocking WiFi Recovery
+  // 1. WiFi Reconnection Handler
   if (now - lastWiFiCheck >= 15000) {
     lastWiFiCheck = now;
     if (WiFi.status() != WL_CONNECTED) {
@@ -256,11 +266,11 @@ void loop() {
     }
   }
 
-  // 2. Read Sensors & Transmit Data
+  // 2. Read Sensors and Communicate
   if (now - lastSend >= SEND_INTERVAL) {
     lastSend = now;
 
-    // --- Read Inverter PZEM (Primary) ---
+    // Direct Read: Inverter PZEM (Primary)
     float temp_v = pzemPrimary.voltage();
     float temp_i = pzemPrimary.current();
     float temp_p = pzemPrimary.power();
@@ -269,7 +279,7 @@ void loop() {
 
     if (isnan(temp_v) || temp_v < 0) {
       p_voltage = 0.0; p_current = 0.0; p_power = 0.0; p_pf = 0.0;
-      Serial.println("[PZEM] Primary read failed or AC disconnected.");
+      Serial.println("[PZEM] Primary read error / AC offline.");
     } else {
       p_voltage = temp_v;
       p_current = temp_i;
@@ -278,8 +288,21 @@ void loop() {
       p_pf      = temp_pf;
     }
 
-    // --- Calculated / Derived Load Metrics ---
-    if (p_voltage > 10.0) {
+    // Direct Read: Dedicated Load PZEM
+    float l_temp_v = pzemLoad.voltage();
+    float l_temp_i = pzemLoad.current();
+    float l_temp_p = pzemLoad.power();
+    float l_temp_e = pzemLoad.energy();
+    float l_temp_pf = pzemLoad.pf();
+
+    if (!isnan(l_temp_v) && l_temp_v > 0) {
+      l_voltage = l_temp_v;
+      l_current = l_temp_i;
+      l_power   = l_temp_p;
+      l_energy  = l_temp_e;
+      l_pf      = l_temp_pf;
+    } else if (p_voltage > 10.0) {
+      // Fallback: Derivation if second PZEM bus is offline
       l_voltage = p_voltage - 2.0;
       l_current = p_current;
       l_pf = (p_pf > 0) ? p_pf : 0.95;
@@ -289,7 +312,7 @@ void loop() {
       l_voltage = 0; l_current = 0; l_power = 0; l_pf = 0;
     }
 
-    // --- Read INA219 Battery Data ---
+    // Read Battery DC Metrics (INA219)
     float busvoltage = ina219.getBusVoltage_V();
     float shuntvoltage = ina219.getShuntVoltage_mV();
     float current_mA = ina219.getCurrent_mA();
@@ -307,18 +330,22 @@ void loop() {
       batt_soc = calculateBatterySoC(batt_voltage);
     }
 
-    // --- Console Diagnostic Output ---
-    Serial.printf("\n--- Reading #%d (Fails: %d) ---\n", sendCount + 1, failCount);
-    Serial.printf("Inv:  %.1fV | %.2fA | %.1fW | PF:%.2f\n", p_voltage, p_current, p_power, p_pf);
-    Serial.printf("Load: %.1fV | %.2fA | %.1fW\n", l_voltage, l_current, l_power);
-    Serial.printf("Batt: %.2fV | %.2fA | %.1fW | SoC:%.1f%%\n", batt_voltage, batt_current_A, batt_power_W, batt_soc);
-    Serial.printf("Relays: R1=%s R2=%s\n", relay1State ? "ON" : "OFF", relay2State ? "ON" : "OFF");
+    // Enforce Critical Load Hardware Pin Safety
+    digitalWrite(RELAY1_PIN, RELAY_ON);
+    relay1State = true;
+
+    // Diagnostics
+    Serial.printf("\n--- Telemetry Pulse #%d (Failures: %d) ---\n", sendCount + 1, failCount);
+    Serial.printf("Inverter: %.1fV | %.2fA | %.1fW | PF:%.2f\n", p_voltage, p_current, p_power, p_pf);
+    Serial.printf("Load:     %.1fV | %.2fA | %.1fW | Energy:%.2fWh\n", l_voltage, l_current, l_power, l_energy);
+    Serial.printf("Battery:  %.2fV | %.2fA | %.1fW | SoC:%.1f%%\n", batt_voltage, batt_current_A, batt_power_W, batt_soc);
+    Serial.printf("Relays:   R1=%s (Critical Locked) | R2=%s\n", relay1State ? "ON" : "OFF", relay2State ? "ON" : "OFF");
 
     sendSensorData();
     pollCommands();
   }
 
-  // 3. Update LCD Screen Non-blocking
+  // 3. LCD Screen Update Cycle
   if (now - lastDisplaySwitch >= LCD_INTERVAL) {
     lastDisplaySwitch = now;
     updateLCDScreen();

@@ -22,7 +22,6 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
-from bird import Bird
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -64,15 +63,24 @@ historical_power = []
 # ========== EMAIL NOTIFICATIONS ==========
 def send_email(subject, html_body):
     try:
-        bird = Bird(BIRD_API_KEY)
-        result = bird.email.send(
-            from_address="onboarding@messagebird.dev",
-            to=[EMAIL_TO],
-            subject=subject,
-            html=html_body
-        )
-        print(f"Email sent: {subject}")
-        return True
+        url = "https://email.messagebird.com/v1/email"
+        headers = {
+            "Authorization": f"AccessKey {BIRD_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "from": "onboarding@messagebird.dev",
+            "to": [EMAIL_TO],
+            "subject": subject,
+            "html": html_body
+        }
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        if response.status_code in (200, 201):
+            print(f"Email sent: {subject}")
+            return True
+        else:
+            print(f"Email error {response.status_code}: {response.text[:200]}")
+            return False
     except Exception as e:
         print(f"Email send error: {e}")
         return False
