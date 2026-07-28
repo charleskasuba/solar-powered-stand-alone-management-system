@@ -17,11 +17,12 @@ from io import BytesIO
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
+from bird import Bird
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -35,6 +36,8 @@ HISTORICAL_DATA_FILE = 'historical_power_data.csv'
 DB_FILE = 'solar_data.db'
 ZMW_PER_KWH = 2.5
 KG_CO2_PER_KWH = 0.5
+BIRD_API_KEY = "bk_eu1_CX53rclKcsQZUy5Hat1KAnC4S18uB"
+EMAIL_TO = "mwansakapikila48@gmail.com"
 
 # ========== GLOBAL DATA STORAGE ==========
 system_data = {
@@ -58,31 +61,114 @@ command_lock = threading.Lock()
 real_time_power = deque(maxlen=60)
 historical_power = []
 
+# ========== EMAIL NOTIFICATIONS ==========
+def send_email(subject, html_body):
+    try:
+        bird = Bird(BIRD_API_KEY)
+        result = bird.email.send(
+            from_address="onboarding@messagebird.dev",
+            to=[EMAIL_TO],
+            subject=subject,
+            html=html_body
+        )
+        print(f"Email sent: {subject}")
+        return True
+    except Exception as e:
+        print(f"Email send error: {e}")
+        return False
+
+def notify_esp32_offline():
+    html = """
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
+        <div style="background:#f44336;color:white;padding:15px;border-radius:8px;text-align:center">
+            <h2>Solar Microgrid Alert</h2>
+        </div>
+        <div style="padding:20px;background:#fff3f3;border:1px solid #f44336;border-radius:0 0 8px 8px">
+            <h3 style="color:#f44336">ESP32 is OFFLINE</h3>
+            <p>The ESP32 controller has lost connection with the server.</p>
+            <p><strong>Last seen:</strong> """ + str(system_data['last_esp32_seen'] or 'Never') + """</p>
+            <p><strong>Time:</strong> """ + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + """</p>
+            <hr>
+            <p style="color:#666;font-size:12px">Copperbelt University Solar Microgrid System</p>
+        </div>
+    </div>
+    """
+    send_email("Solar Microgrid Alert: ESP32 OFFLINE", html)
+
+def notify_low_battery(soc):
+    html = """
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
+        <div style="background:#ff9800;color:white;padding:15px;border-radius:8px;text-align:center">
+            <h2>Solar Microgrid Warning</h2>
+        </div>
+        <div style="padding:20px;background:#fff8e1;border:1px solid #ff9800;border-radius:0 0 8px 8px">
+            <h3 style="color:#ff9800">Low Battery Warning</h3>
+            <p>Battery State of Charge has dropped below safe levels.</p>
+            <p><strong>Current SOC:</strong> """ + f"{soc:.1f}%" + """</p>
+            <p><strong>Voltage:</strong> """ + f"{system_data['battery_voltage']:.2f}V" + """</p>
+            <p><strong>Load Power:</strong> """ + f"{system_data['load_power']:.1f}W" + """</p>
+            <p><strong>Time:</strong> """ + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + """</p>
+            <hr>
+            <p style="color:#666;font-size:12px">Copperbelt University Solar Microgrid System</p>
+        </div>
+    </div>
+    """
+    send_email(f"Solar Microgrid: Low Battery ({soc:.0f}%)", html)
+
+def notify_esp32_online():
+    html = """
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
+        <div style="background:#4CAF50;color:white;padding:15px;border-radius:8px;text-align:center">
+            <h2>Solar Microgrid Status</h2>
+        </div>
+        <div style="padding:20px;background:#f1f8e9;border:1px solid #4CAF50;border-radius:0 0 8px 8px">
+            <h3 style="color:#4CAF50">ESP32 is BACK ONLINE</h3>
+            <p>The ESP32 controller has reconnected successfully.</p>
+            <p><strong>Battery SOC:</strong> """ + f"{system_data['battery_soc']:.1f}%" + """</p>
+            <p><strong>Time:</strong> """ + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + """</p>
+            <hr>
+            <p style="color:#666;font-size:12px">Copperbelt University Solar Microgrid System</p>
+        </div>
+    </div>
+    """
+    send_email("Solar Microgrid: ESP32 Back Online", html)
+
+# Track email notification state to avoid spam
+email_alert_state = {'esp32_was_online': False, 'low_battery_sent': False}
+
 # ========== DATABASE ==========
+def get_db():
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS sensor_readings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
-        battery_voltage REAL, battery_current REAL, battery_soc REAL,
-        inverter_voltage REAL, inverter_current REAL, inverter_power REAL,
-        load_voltage REAL, load_current REAL, load_power REAL,
-        energy_consumed_kwh REAL, energy_produced_kwh REAL,
-        relay1_state TEXT, relay2_state TEXT, power_balance REAL
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS relay_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
-        relay INTEGER, state TEXT, source TEXT
-    )''')
-    conn.commit()
-    conn.close()
-    print("Database initialized")
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS sensor_readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+            battery_voltage REAL, battery_current REAL, battery_soc REAL,
+            inverter_voltage REAL, inverter_current REAL, inverter_power REAL,
+            load_voltage REAL, load_current REAL, load_power REAL,
+            energy_consumed_kwh REAL, energy_produced_kwh REAL,
+            relay1_state TEXT, relay2_state TEXT, power_balance REAL
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS relay_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+            relay INTEGER, state TEXT, source TEXT
+        )''')
+        conn.commit()
+        conn.close()
+        print("Database initialized")
+    except Exception as e:
+        print(f"DB init error: {e}")
 
 def log_sensor_reading():
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=10)
         c = conn.cursor()
         c.execute('''INSERT INTO sensor_readings
             (timestamp, battery_voltage, battery_current, battery_soc,
@@ -104,7 +190,7 @@ def log_sensor_reading():
 
 def log_relay_event(relay, state, source='manual'):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=10)
         c = conn.cursor()
         c.execute('INSERT INTO relay_events (timestamp, relay, state, source) VALUES (?, ?, ?, ?)',
                   (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), relay, state, source))
@@ -114,24 +200,30 @@ def log_relay_event(relay, state, source='manual'):
         print(f"DB relay log error: {e}")
 
 def get_readings_between(start_date, end_date):
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute('SELECT * FROM sensor_readings WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp',
-              (start_date, end_date))
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT * FROM sensor_readings WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp',
+                  (start_date, end_date))
+        rows = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"DB read error: {e}")
+        return []
 
 def get_relay_events_between(start_date, end_date):
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute('SELECT * FROM relay_events WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp',
-              (start_date, end_date))
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT * FROM relay_events WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp',
+                  (start_date, end_date))
+        rows = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"DB relay read error: {e}")
+        return []
 
 # ========== HISTORICAL DATA ==========
 def init_historical_data():
@@ -173,38 +265,45 @@ def init_historical_data():
     print(f"Generated {len(historical_power)} historical records")
 
 def save_historical_to_csv():
-    with open(HISTORICAL_DATA_FILE, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['timestamp', 'consumed_power', 'produced_power'])
-        for record in historical_power:
-            writer.writerow([record['timestamp'], record['consumed'], record['produced']])
+    try:
+        with open(HISTORICAL_DATA_FILE, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['timestamp', 'consumed_power', 'produced_power'])
+            for record in historical_power:
+                writer.writerow([record['timestamp'], record['consumed'], record['produced']])
+    except Exception as e:
+        print(f"CSV save error: {e}")
 
 # ========== PREDICTIONS ==========
 def calculate_energy_predictions():
     if len(historical_power) < 24:
         return {'today_energy': 5.5, 'tomorrow_energy': 5.8, 'weekly_energy': 40, 'peak_hours': []}
-    df = pd.DataFrame(historical_power)
-    df['hour'] = df['timestamp'].dt.hour
-    hourly_avg = df.groupby('hour')['consumed'].mean()
-    current_hour = datetime.now().hour
-    remaining_hours = 24 - current_hour
-    current_avg = hourly_avg[current_hour] if current_hour in hourly_avg.index else 500
-    today_energy = (current_avg * remaining_hours + system_data['energy_consumed_kwh'] * 1000) / 1000
-    peak_hours = []
-    threshold = hourly_avg.quantile(0.75)
-    for hour in range(24):
-        if hourly_avg[hour] > threshold:
-            peak_hours.append({
-                'hour': f"{hour:02d}:00-{(hour+1):02d}:00",
-                'factor': round(hourly_avg[hour] / hourly_avg.mean(), 2),
-                'reason': 'High demand period'
-            })
-    return {
-        'today_energy': round(today_energy, 2),
-        'tomorrow_energy': round(hourly_avg.mean() * 24 / 1000, 2),
-        'weekly_energy': round(hourly_avg.mean() * 24 * 7 / 1000, 2),
-        'peak_hours': peak_hours[:4]
-    }
+    try:
+        df = pd.DataFrame(historical_power)
+        df['hour'] = df['timestamp'].dt.hour
+        hourly_avg = df.groupby('hour')['consumed'].mean()
+        current_hour = datetime.now().hour
+        remaining_hours = 24 - current_hour
+        current_avg = hourly_avg.get(current_hour, 500)
+        today_energy = (current_avg * remaining_hours + system_data['energy_consumed_kwh'] * 1000) / 1000
+        peak_hours = []
+        threshold = hourly_avg.quantile(0.75)
+        for hour in range(24):
+            if hourly_avg[hour] > threshold:
+                peak_hours.append({
+                    'hour': f"{hour:02d}:00-{(hour+1):02d}:00",
+                    'factor': round(hourly_avg[hour] / hourly_avg.mean(), 2),
+                    'reason': 'High demand period'
+                })
+        return {
+            'today_energy': round(today_energy, 2),
+            'tomorrow_energy': round(hourly_avg.mean() * 24 / 1000, 2),
+            'weekly_energy': round(hourly_avg.mean() * 24 * 7 / 1000, 2),
+            'peak_hours': peak_hours[:4]
+        }
+    except Exception as e:
+        print(f"Prediction error: {e}")
+        return {'today_energy': 0, 'tomorrow_energy': 0, 'weekly_energy': 0, 'peak_hours': []}
 
 def generate_recommendations():
     recommendations = []
@@ -276,17 +375,44 @@ def update_weather_periodically():
         time.sleep(3600)
 
 def check_esp32_status():
+    global email_alert_state
     while True:
         time.sleep(15)
-        if system_data['last_esp32_seen']:
-            last = datetime.strptime(system_data['last_esp32_seen'], '%Y-%m-%d %H:%M:%S')
-            if (datetime.now() - last).total_seconds() > 20:
-                if system_data['esp32_online']:
-                    system_data['esp32_online'] = False
-                    system_data['recommendations'] = generate_recommendations()
-                    print("ESP32 went OFFLINE")
-        elif system_data['esp32_online']:
-            system_data['esp32_online'] = False
+        try:
+            if system_data['last_esp32_seen']:
+                last = datetime.strptime(system_data['last_esp32_seen'], '%Y-%m-%d %H:%M:%S')
+                if (datetime.now() - last).total_seconds() > 20:
+                    if system_data['esp32_online']:
+                        system_data['esp32_online'] = False
+                        system_data['recommendations'] = generate_recommendations()
+                        print("ESP32 went OFFLINE")
+                        if not email_alert_state['esp32_was_online']:
+                            pass
+                        else:
+                            notify_esp32_offline()
+                            email_alert_state['esp32_was_online'] = False
+                else:
+                    if not email_alert_state['esp32_was_online'] and system_data['esp32_online']:
+                        email_alert_state['esp32_was_online'] = True
+                        notify_esp32_online()
+                        email_alert_state['low_battery_sent'] = False
+            elif system_data['esp32_online']:
+                system_data['esp32_online'] = False
+        except Exception as e:
+            print(f"ESP32 status check error: {e}")
+
+def check_battery_email():
+    while True:
+        time.sleep(60)
+        try:
+            soc = system_data['battery_soc']
+            if system_data['esp32_online'] and soc > 0 and soc < 20 and not email_alert_state['low_battery_sent']:
+                notify_low_battery(soc)
+                email_alert_state['low_battery_sent'] = True
+            elif soc >= 25:
+                email_alert_state['low_battery_sent'] = False
+        except Exception as e:
+            print(f"Battery email check error: {e}")
 
 # ========== FLASK API ROUTES ==========
 @app.route('/')
@@ -335,7 +461,6 @@ def update_from_esp32():
         system_data['predictions'] = calculate_energy_predictions()
         system_data['recommendations'] = generate_recommendations()
 
-        print(f"OK Load:{system_data['load_power']:.1f}W Inv:{system_data['inverter_power']:.1f}W Bat:{system_data['battery_soc']:.1f}%")
         return jsonify({'status': 'ok'}), 200
     except Exception as e:
         print(f"Update error: {e}")
@@ -440,195 +565,226 @@ def get_historical_data():
 
 @app.route('/api/comparison')
 def get_comparison():
-    now = datetime.now()
-    this_month_start = now.replace(day=1, hour=0, minute=0, second=0)
-    last_month_end = this_month_start - timedelta(seconds=1)
-    last_month_start = last_month_end.replace(day=1, hour=0, minute=0, second=0)
+    try:
+        now = datetime.now()
+        this_month_start = now.replace(day=1, hour=0, minute=0, second=0)
+        last_month_end = this_month_start - timedelta(seconds=1)
+        last_month_start = last_month_end.replace(day=1, hour=0, minute=0, second=0)
 
-    this_rows = get_readings_between(this_month_start.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d %H:%M:%S'))
-    last_rows = get_readings_between(last_month_start.strftime('%Y-%m-%d'), last_month_end.strftime('%Y-%m-%d %H:%M:%S'))
+        this_rows = get_readings_between(this_month_start.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d %H:%M:%S'))
+        last_rows = get_readings_between(last_month_start.strftime('%Y-%m-%d'), last_month_end.strftime('%Y-%m-%d %H:%M:%S'))
 
-    def daily_avg(rows):
-        if not rows:
-            return {'dates': [], 'consumed': [], 'produced': []}
-        df = pd.DataFrame(rows)
-        df['date'] = pd.to_datetime(df['timestamp']).dt.date
-        daily = df.groupby('date').agg({'load_power': 'mean', 'inverter_power': 'mean'}).reset_index()
-        return {
-            'dates': daily['date'].astype(str).tolist(),
-            'consumed': daily['load_power'].round(1).tolist(),
-            'produced': daily['inverter_power'].round(1).tolist()
-        }
+        def daily_avg(rows):
+            if not rows:
+                return {'dates': [], 'consumed': [], 'produced': []}
+            df = pd.DataFrame(rows)
+            df['date'] = pd.to_datetime(df['timestamp']).dt.date
+            daily = df.groupby('date').agg({'load_power': 'mean', 'inverter_power': 'mean'}).reset_index()
+            return {
+                'dates': daily['date'].astype(str).tolist(),
+                'consumed': daily['load_power'].round(1).tolist(),
+                'produced': daily['inverter_power'].round(1).tolist()
+            }
 
-    return jsonify({
-        'this_month': daily_avg(this_rows),
-        'last_month': daily_avg(last_rows),
-        'this_month_label': this_month_start.strftime('%B %Y'),
-        'last_month_label': last_month_start.strftime('%B %Y')
-    })
+        return jsonify({
+            'this_month': daily_avg(this_rows),
+            'last_month': daily_avg(last_rows),
+            'this_month_label': this_month_start.strftime('%B %Y'),
+            'last_month_label': last_month_start.strftime('%B %Y')
+        })
+    except Exception as e:
+        print(f"Comparison error: {e}")
+        return jsonify({
+            'this_month': {'dates': [], 'consumed': [], 'produced': []},
+            'last_month': {'dates': [], 'consumed': [], 'produced': []},
+            'this_month_label': datetime.now().strftime('%B %Y'),
+            'last_month_label': (datetime.now() - timedelta(days=30)).strftime('%B %Y')
+        })
 
 @app.route('/api/export/csv')
 def export_csv():
-    start = request.args.get('start', (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'))
-    end = request.args.get('end', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-    rows = get_readings_between(start, end)
-    output = BytesIO()
-    writer_text = []
-    writer_text.append('timestamp,battery_voltage,battery_current,battery_soc,inverter_voltage,inverter_current,inverter_power,load_voltage,load_current,load_power,energy_consumed_kwh,energy_produced_kwh,relay1_state,relay2_state,power_balance\n')
-    for r in rows:
-        writer_text.append(f"{r['timestamp']},{r['battery_voltage']},{r['battery_current']},{r['battery_soc']},{r['inverter_voltage']},{r['inverter_current']},{r['inverter_power']},{r['load_voltage']},{r['load_current']},{r['load_power']},{r['energy_consumed_kwh']},{r['energy_produced_kwh']},{r['relay1_state']},{r['relay2_state']},{r['power_balance']}\n")
-    output.write(''.join(writer_text).encode('utf-8'))
-    output.seek(0)
-    filename = f"solar_data_{start}_{end[:10]}.csv"
-    return send_file(output, mimetype='text/csv', as_attachment=True, download_name=filename)
+    try:
+        start = request.args.get('start', (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'))
+        end = request.args.get('end', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        rows = get_readings_between(start, end)
+        output = BytesIO()
+        writer_text = ['timestamp,battery_voltage,battery_current,battery_soc,inverter_voltage,inverter_current,inverter_power,load_voltage,load_current,load_power,energy_consumed_kwh,energy_produced_kwh,relay1_state,relay2_state,power_balance\n']
+        for r in rows:
+            writer_text.append(f"{r['timestamp']},{r['battery_voltage']},{r['battery_current']},{r['battery_soc']},{r['inverter_voltage']},{r['inverter_current']},{r['inverter_power']},{r['load_voltage']},{r['load_current']},{r['load_power']},{r['energy_consumed_kwh']},{r['energy_produced_kwh']},{r['relay1_state']},{r['relay2_state']},{r['power_balance']}\n")
+        output.write(''.join(writer_text).encode('utf-8'))
+        output.seek(0)
+        filename = f"solar_data_{start}_{end[:10]}.csv"
+        return send_file(output, mimetype='text/csv', as_attachment=True, download_name=filename)
+    except Exception as e:
+        print(f"CSV export error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/export/excel')
 def export_excel():
-    start = request.args.get('start', (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'))
-    end = request.args.get('end', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-    rows = get_readings_between(start, end)
+    try:
+        start = request.args.get('start', (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'))
+        end = request.args.get('end', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        rows = get_readings_between(start, end)
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Sensor Readings"
-    headers = ['Timestamp', 'Battery V', 'Battery A', 'SOC%', 'Inv V', 'Inv A', 'Inv W', 'Load V', 'Load A', 'Load W', 'Cons kWh', 'Prod kWh', 'R1', 'R2', 'Balance W']
-    header_fill = PatternFill(start_color='1a1a2e', end_color='1a1a2e', fill_type='solid')
-    header_font = Font(color='FFFFFF', bold=True)
-    for col, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=h)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal='center')
-    for i, r in enumerate(rows, 2):
-        ws.cell(row=i, column=1, value=r['timestamp'])
-        ws.cell(row=i, column=2, value=r['battery_voltage'])
-        ws.cell(row=i, column=3, value=r['battery_current'])
-        ws.cell(row=i, column=4, value=r['battery_soc'])
-        ws.cell(row=i, column=5, value=r['inverter_voltage'])
-        ws.cell(row=i, column=6, value=r['inverter_current'])
-        ws.cell(row=i, column=7, value=r['inverter_power'])
-        ws.cell(row=i, column=8, value=r['load_voltage'])
-        ws.cell(row=i, column=9, value=r['load_current'])
-        ws.cell(row=i, column=10, value=r['load_power'])
-        ws.cell(row=i, column=11, value=r['energy_consumed_kwh'])
-        ws.cell(row=i, column=12, value=r['energy_produced_kwh'])
-        ws.cell(row=i, column=13, value=r['relay1_state'])
-        ws.cell(row=i, column=14, value=r['relay2_state'])
-        ws.cell(row=i, column=15, value=r['power_balance'])
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Sensor Readings"
+        headers = ['Timestamp', 'Battery V', 'Battery A', 'SOC%', 'Inv V', 'Inv A', 'Inv W', 'Load V', 'Load A', 'Load W', 'Cons kWh', 'Prod kWh', 'R1', 'R2', 'Balance W']
+        header_fill = PatternFill(start_color='1a1a2e', end_color='1a1a2e', fill_type='solid')
+        header_font = Font(color='FFFFFF', bold=True)
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center')
+        for i, r in enumerate(rows, 2):
+            ws.cell(row=i, column=1, value=r['timestamp'])
+            ws.cell(row=i, column=2, value=r['battery_voltage'])
+            ws.cell(row=i, column=3, value=r['battery_current'])
+            ws.cell(row=i, column=4, value=r['battery_soc'])
+            ws.cell(row=i, column=5, value=r['inverter_voltage'])
+            ws.cell(row=i, column=6, value=r['inverter_current'])
+            ws.cell(row=i, column=7, value=r['inverter_power'])
+            ws.cell(row=i, column=8, value=r['load_voltage'])
+            ws.cell(row=i, column=9, value=r['load_current'])
+            ws.cell(row=i, column=10, value=r['load_power'])
+            ws.cell(row=i, column=11, value=r['energy_consumed_kwh'])
+            ws.cell(row=i, column=12, value=r['energy_produced_kwh'])
+            ws.cell(row=i, column=13, value=r['relay1_state'])
+            ws.cell(row=i, column=14, value=r['relay2_state'])
+            ws.cell(row=i, column=15, value=r['power_balance'])
 
-    if rows:
-        df = pd.DataFrame(rows)
-        ws2 = wb.create_sheet("Summary")
-        ws2.cell(row=1, column=1, value="Metric").fill = header_fill
-        ws2.cell(row=1, column=1).font = header_font
-        ws2.cell(row=1, column=2, value="Average").fill = header_fill
-        ws2.cell(row=1, column=2).font = header_font
-        ws2.cell(row=1, column=3, value="Min").fill = header_fill
-        ws2.cell(row=1, column=3).font = header_font
-        ws2.cell(row=1, column=4, value="Max").fill = header_fill
-        ws2.cell(row=1, column=4).font = header_font
-        metrics = [('Battery SOC%', 'battery_soc'), ('Inverter Power W', 'inverter_power'),
-                   ('Load Power W', 'load_power'), ('Battery Voltage V', 'battery_voltage')]
-        for i, (name, col) in enumerate(metrics, 2):
-            ws2.cell(row=i, column=1, value=name)
-            ws2.cell(row=i, column=2, value=round(df[col].mean(), 2))
-            ws2.cell(row=i, column=3, value=round(df[col].min(), 2))
-            ws2.cell(row=i, column=4, value=round(df[col].max(), 2))
+        if rows:
+            df = pd.DataFrame(rows)
+            ws2 = wb.create_sheet("Summary")
+            ws2.cell(row=1, column=1, value="Metric").fill = header_fill
+            ws2.cell(row=1, column=1).font = header_font
+            ws2.cell(row=1, column=2, value="Average").fill = header_fill
+            ws2.cell(row=1, column=2).font = header_font
+            ws2.cell(row=1, column=3, value="Min").fill = header_fill
+            ws2.cell(row=1, column=3).font = header_font
+            ws2.cell(row=1, column=4, value="Max").fill = header_fill
+            ws2.cell(row=1, column=4).font = header_font
+            metrics = [('Battery SOC%', 'battery_soc'), ('Inverter Power W', 'inverter_power'),
+                       ('Load Power W', 'load_power'), ('Battery Voltage V', 'battery_voltage')]
+            for i, (name, col_name) in enumerate(metrics, 2):
+                ws2.cell(row=i, column=1, value=name)
+                ws2.cell(row=i, column=2, value=round(df[col_name].mean(), 2))
+                ws2.cell(row=i, column=3, value=round(df[col_name].min(), 2))
+                ws2.cell(row=i, column=4, value=round(df[col_name].max(), 2))
 
-    output = BytesIO()
-    wb.save(output)
-    output.seek(0)
-    filename = f"solar_data_{start}_{end[:10]}.xlsx"
-    return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                     as_attachment=True, download_name=filename)
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        filename = f"solar_data_{start}_{end[:10]}.xlsx"
+        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                         as_attachment=True, download_name=filename)
+    except Exception as e:
+        print(f"Excel export error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/report/monthly')
 def monthly_report():
-    month = request.args.get('month', datetime.now().month, type=int)
-    year = request.args.get('year', datetime.now().year, type=int)
-    start_date = f"{year}-{month:02d}-01"
-    last_day = calendar.monthrange(year, month)[1]
-    end_date = f"{year}-{month:02d}-{last_day:02d} 23:59:59"
-    rows = get_readings_between(start_date, end_date)
-    relay_events = get_relay_events_between(start_date, end_date)
+    try:
+        month = request.args.get('month', datetime.now().month, type=int)
+        year = request.args.get('year', datetime.now().year, type=int)
+        start_date = f"{year}-{month:02d}-01"
+        last_day = calendar.monthrange(year, month)[1]
+        end_date = f"{year}-{month:02d}-{last_day:02d} 23:59:59"
+        rows = get_readings_between(start_date, end_date)
+        relay_events = get_relay_events_between(start_date, end_date)
 
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=20*mm, bottomMargin=20*mm)
-    styles = getSampleStyleSheet()
-    elements = []
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=20*mm, bottomMargin=20*mm)
+        styles = getSampleStyleSheet()
+        elements = []
 
-    title_style = ParagraphStyle('Title2', parent=styles['Title'], fontSize=20, spaceAfter=10)
-    subtitle_style = ParagraphStyle('Subtitle2', parent=styles['Normal'], fontSize=12, alignment=TA_CENTER, spaceAfter=20, textColor=colors.grey)
-    elements.append(Paragraph("Copperbelt University - Solar Microgrid", title_style))
-    elements.append(Paragraph(f"Monthly Energy Report - {calendar.month_name[month]} {year}", subtitle_style))
-    elements.append(Paragraph(f"Location: Kitwe, Zambia | Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", subtitle_style))
-    elements.append(Spacer(1, 10*mm))
+        title_style = ParagraphStyle('Title2', parent=styles['Title'], fontSize=20, spaceAfter=10)
+        subtitle_style = ParagraphStyle('Subtitle2', parent=styles['Normal'], fontSize=12, alignment=TA_CENTER, spaceAfter=20, textColor=colors.grey)
+        elements.append(Paragraph("Copperbelt University - Solar Microgrid", title_style))
+        elements.append(Paragraph(f"Monthly Energy Report - {calendar.month_name[month]} {year}", subtitle_style))
+        elements.append(Paragraph(f"Location: Kitwe, Zambia | Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", subtitle_style))
+        elements.append(Spacer(1, 10*mm))
 
-    elements.append(Paragraph("Summary Statistics", styles['Heading2']))
-    if rows:
-        df = pd.DataFrame(rows)
-        summary_data = [
-            ['Metric', 'Average', 'Min', 'Max', 'Unit'],
-            ['Battery SOC', f"{df['battery_soc'].mean():.1f}", f"{df['battery_soc'].min():.1f}", f"{df['battery_soc'].max():.1f}", '%'],
-            ['Battery Voltage', f"{df['battery_voltage'].mean():.2f}", f"{df['battery_voltage'].min():.2f}", f"{df['battery_voltage'].max():.2f}", 'V'],
-            ['Inverter Power', f"{df['inverter_power'].mean():.1f}", f"{df['inverter_power'].min():.1f}", f"{df['inverter_power'].max():.1f}", 'W'],
-            ['Load Power', f"{df['load_power'].mean():.1f}", f"{df['load_power'].min():.1f}", f"{df['load_power'].max():.1f}", 'W'],
-            ['Power Balance', f"{df['power_balance'].mean():.1f}", f"{df['power_balance'].min():.1f}", f"{df['power_balance'].max():.1f}", 'W'],
-        ]
-        total_energy_consumed = df['load_power'].mean() * len(rows) * 5 / 3600 / 1000
-        total_energy_produced = df['inverter_power'].mean() * len(rows) * 5 / 3600 / 1000
-        cost_savings = total_energy_produced * ZMW_PER_KWH
-        co2_offset = total_energy_produced * KG_CO2_PER_KWH
+        elements.append(Paragraph("Summary Statistics", styles['Heading2']))
+        if rows:
+            df = pd.DataFrame(rows)
+            summary_data = [
+                ['Metric', 'Average', 'Min', 'Max', 'Unit'],
+                ['Battery SOC', f"{df['battery_soc'].mean():.1f}", f"{df['battery_soc'].min():.1f}", f"{df['battery_soc'].max():.1f}", '%'],
+                ['Battery Voltage', f"{df['battery_voltage'].mean():.2f}", f"{df['battery_voltage'].min():.2f}", f"{df['battery_voltage'].max():.2f}", 'V'],
+                ['Inverter Power', f"{df['inverter_power'].mean():.1f}", f"{df['inverter_power'].min():.1f}", f"{df['inverter_power'].max():.1f}", 'W'],
+                ['Load Power', f"{df['load_power'].mean():.1f}", f"{df['load_power'].min():.1f}", f"{df['load_power'].max():.1f}", 'W'],
+                ['Power Balance', f"{df['power_balance'].mean():.1f}", f"{df['power_balance'].min():.1f}", f"{df['power_balance'].max():.1f}", 'W'],
+            ]
+            total_energy_consumed = df['load_power'].mean() * len(rows) * 5 / 3600 / 1000
+            total_energy_produced = df['inverter_power'].mean() * len(rows) * 5 / 3600 / 1000
+            cost_savings = total_energy_produced * ZMW_PER_KWH
+            co2_offset = total_energy_produced * KG_CO2_PER_KWH
 
-        summary_data.append(['Total Energy Consumed', f"{total_energy_consumed:.2f}", '', '', 'kWh'])
-        summary_data.append(['Total Energy Produced', f"{total_energy_produced:.2f}", '', '', 'kWh'])
-        summary_data.append(['Cost Savings', f"{cost_savings:.2f}", '', '', 'ZMW'])
-        summary_data.append(['CO2 Offset', f"{co2_offset:.2f}", '', '', 'kg'])
+            summary_data.append(['Total Energy Consumed', f"{total_energy_consumed:.2f}", '', '', 'kWh'])
+            summary_data.append(['Total Energy Produced', f"{total_energy_produced:.2f}", '', '', 'kWh'])
+            summary_data.append(['Cost Savings', f"{cost_savings:.2f}", '', '', 'ZMW'])
+            summary_data.append(['CO2 Offset', f"{co2_offset:.2f}", '', '', 'kg'])
 
-        table = Table(summary_data, colWidths=[120, 70, 70, 70, 50])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1a2e')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('FONTSIZE', (0, 1), (-1, -1), 9),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f0f0')]),
-        ]))
-        elements.append(table)
-    else:
-        elements.append(Paragraph("No data available for this period.", styles['Normal']))
+            table = Table(summary_data, colWidths=[120, 70, 70, 70, 50])
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1a2e')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('FONTSIZE', (0, 0), (-1, 0), 10),
+                ('FONTSIZE', (0, 1), (-1, -1), 9),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f0f0')]),
+            ]))
+            elements.append(table)
+        else:
+            elements.append(Paragraph("No data available for this period.", styles['Normal']))
 
-    elements.append(Spacer(1, 10*mm))
-    elements.append(Paragraph("Relay Events", styles['Heading2']))
-    if relay_events:
-        relay_data = [['Timestamp', 'Relay', 'State', 'Source']]
-        for e in relay_events[:50]:
-            relay_data.append([e['timestamp'], str(e['relay']), e['state'], e['source']])
-        relay_table = Table(relay_data, colWidths=[130, 50, 50, 100])
-        relay_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2196F3')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('FONTSIZE', (0, 0), (-1, -1), 8),
-        ]))
-        elements.append(relay_table)
-    else:
-        elements.append(Paragraph("No relay events this month.", styles['Normal']))
+        elements.append(Spacer(1, 10*mm))
+        elements.append(Paragraph("Relay Events", styles['Heading2']))
+        if relay_events:
+            relay_data = [['Timestamp', 'Relay', 'State', 'Source']]
+            for e in relay_events[:50]:
+                relay_data.append([e['timestamp'], str(e['relay']), e['state'], e['source']])
+            relay_table = Table(relay_data, colWidths=[130, 50, 50, 100])
+            relay_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2196F3')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ]))
+            elements.append(relay_table)
+        else:
+            elements.append(Paragraph("No relay events this month.", styles['Normal']))
 
-    elements.append(Spacer(1, 15*mm))
-    elements.append(Paragraph(f"Tariff: ZMW {ZMW_PER_KWH}/kWh | CO2 Factor: {KG_CO2_PER_KWH} kg/kWh", styles['Normal']))
+        elements.append(Spacer(1, 15*mm))
+        elements.append(Paragraph(f"Tariff: ZMW {ZMW_PER_KWH}/kWh | CO2 Factor: {KG_CO2_PER_KWH} kg/kWh", styles['Normal']))
 
-    doc.build(elements)
-    buffer.seek(0)
-    return send_file(buffer, mimetype='application/pdf', as_attachment=True,
-                     download_name=f"solar_report_{year}_{month:02d}.pdf")
+        doc.build(elements)
+        buffer.seek(0)
+        return send_file(buffer, mimetype='application/pdf', as_attachment=True,
+                         download_name=f"solar_report_{year}_{month:02d}.pdf")
+    except Exception as e:
+        print(f"PDF report error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/download_csv')
 def download_csv():
     if os.path.exists(HISTORICAL_DATA_FILE):
         return send_file(HISTORICAL_DATA_FILE, as_attachment=True)
     return "No data available", 404
+
+@app.route('/api/test_email', methods=['POST'])
+def test_email():
+    try:
+        result = send_email("Solar Microgrid: Test Email",
+            '<div style="font-family:Arial;padding:20px"><h2>Test Email</h2><p>Email notifications are working correctly.</p><p>Time: ' + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + '</p></div>')
+        if result:
+            return jsonify({'status': 'ok', 'message': 'Email sent successfully'})
+        return jsonify({'status': 'error', 'message': 'Email send failed - check logs'}), 500
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # ========== HTML DASHBOARD ==========
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -681,6 +837,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .export-pdf{background:#f44336}.export-pdf:hover{background:#d32f2f}
         .config-input{width:60px;padding:5px;border:1px solid #ccc;border-radius:4px;margin:5px}
         .config-label{font-size:13px;color:#666}
+        .email-btn{background:#9c27b0;color:white;padding:10px 20px;border:none;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;margin:5px;transition:all .2s}
+        .email-btn:hover{background:#7b1fa2}
+        .email-btn:disabled{background:#ccc;cursor:not-allowed}
     </style>
 </head>
 <body>
@@ -773,6 +932,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="card-header" style="margin-top:15px">Peak Usage Hours</div>
                 <div id="peak-hours"></div>
             </div>
+            <div class="card">
+                <div class="card-header">Notifications</div>
+                <p style="color:#666;font-size:13px;margin-bottom:15px">Email alerts are sent automatically when ESP32 goes offline or battery is low.</p>
+                <button class="email-btn" onclick="testEmail()" id="email-test-btn">Send Test Email</button>
+                <div id="email-status" style="margin-top:10px;font-size:13px"></div>
+            </div>
         </div>
 
         <div class="grid">
@@ -813,7 +978,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 {label:'Produced (W)',data:[],borderColor:'#4CAF50',backgroundColor:'rgba(76,175,80,.1)',borderWidth:3,tension:.4,fill:true}
             ]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top'},title:{display:true,text:'Last 60 Seconds'}},scales:{y:{beginAtZero:true,title:{display:true,text:'Watts'}},x:{title:{display:true,text:'Time'}}}}});
         }
-        function sendRelayCmd(r,s){fetch('/api/relay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:r,state:s})}).then(r=>r.json()).then(d=>console.log(d)).catch(e=>console.error(e));}
+        function sendRelayCmd(r,s){
+            fetch('/api/relay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:r,state:s})})
+            .then(r=>r.json()).then(d=>{
+                console.log(d);
+                alert('Relay '+r+' -> '+s+': '+d.status);
+            }).catch(e=>{console.error(e);alert('Relay command failed: '+e);});
+        }
+        function testEmail(){
+            const btn=document.getElementById('email-test-btn');
+            const status=document.getElementById('email-status');
+            btn.disabled=true;btn.textContent='Sending...';
+            fetch('/api/test_email',{method:'POST'}).then(r=>r.json()).then(d=>{
+                btn.disabled=false;btn.textContent='Send Test Email';
+                status.innerHTML=d.status==='ok'?'<span style="color:#4CAF50">Email sent successfully!</span>':'<span style="color:#f44336">'+d.message+'</span>';
+            }).catch(e=>{
+                btn.disabled=false;btn.textContent='Send Test Email';
+                status.innerHTML='<span style="color:#f44336">Error: '+e+'</span>';
+            });
+        }
         function exportCSV(){
             const s=document.getElementById('export-start').value||new Date(Date.now()-30*86400000).toISOString().slice(0,10);
             const e=document.getElementById('export-end').value||new Date().toISOString().slice(0,10);
@@ -863,7 +1046,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 if(d.weather&&d.weather.daily&&d.weather.daily.length>0){const w=d.weather.daily[0];document.getElementById('weather-info').innerHTML='<div>Temp: '+w.temp_max+'C/'+w.temp_min+'C</div><div>Condition: '+d.weather.current.condition+'</div>';}
                 if(d.sunlight)document.getElementById('sunlight-info').innerHTML='<div>Sunrise: '+d.sunlight.sunrise+'</div><div>Sunset: '+d.sunlight.sunset+'</div><div>UV: '+d.sunlight.uv_index+'</div>';
                 document.getElementById('timestamp').innerHTML='Last Update: '+d.timestamp;
-            }).catch(e=>console.error(e));
+            }).catch(e=>console.error('Fetch data error:',e));
         }
         function fetchRealTimePower(){
             fetch('/api/real_time_power').then(r=>r.json()).then(d=>{
@@ -873,29 +1056,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     powerChart.data.datasets[1].data=d.produced.slice(-30);
                     powerChart.update();
                 }
-            }).catch(e=>console.error(e));
+            }).catch(e=>console.error('Realtime error:',e));
         }
         function loadHistoricalChart(){
             fetch('/api/historical_data').then(r=>r.json()).then(d=>{
-                Plotly.newPlot('historicalChart',[
-                    {x:d.timestamps,y:d.consumed,name:'Consumed (W)',type:'scatter',mode:'lines',line:{color:'#f44336',width:3}},
-                    {x:d.timestamps,y:d.produced,name:'Produced (W)',type:'scatter',mode:'lines',line:{color:'#4CAF50',width:3}}
-                ],{title:'2-Month Power History',xaxis:{title:'Date',tickangle:-45},yaxis:{title:'Power (W)'},height:420,hovermode:'closest'},{responsive:true});
-            }).catch(e=>console.error(e));
+                if(d.timestamps&&d.timestamps.length>0){
+                    Plotly.newPlot('historicalChart',[
+                        {x:d.timestamps,y:d.consumed,name:'Consumed (W)',type:'scatter',mode:'lines',line:{color:'#f44336',width:3}},
+                        {x:d.timestamps,y:d.produced,name:'Produced (W)',type:'scatter',mode:'lines',line:{color:'#4CAF50',width:3}}
+                    ],{title:'2-Month Power History',xaxis:{title:'Date',tickangle:-45},yaxis:{title:'Power (W)'},height:420,hovermode:'closest'},{responsive:true});
+                } else {
+                    document.getElementById('historicalChart').innerHTML='<div style="text-align:center;padding:40px;color:#999">No historical data yet. Data will appear after ESP32 sends readings.</div>';
+                }
+            }).catch(e=>{console.error('Historical error:',e);document.getElementById('historicalChart').innerHTML='<div style="text-align:center;padding:40px;color:#f44336">Error loading historical data</div>';});
         }
         function loadComparisonChart(){
             fetch('/api/comparison').then(r=>r.json()).then(d=>{
                 const traces=[];
-                if(d.last_month&&d.last_month.dates.length>0){
+                if(d.last_month&&d.last_month.dates&&d.last_month.dates.length>0){
                     traces.push({x:d.last_month.dates,y:d.last_month.consumed,name:d.last_month_label+' Consumed',type:'scatter',mode:'lines',line:{color:'#ff9800',width:2,dash:'dash'}});
                     traces.push({x:d.last_month.dates,y:d.last_month.produced,name:d.last_month_label+' Produced',type:'scatter',mode:'lines',line:{color:'#9e9e9e',width:2,dash:'dash'}});
                 }
-                if(d.this_month&&d.this_month.dates.length>0){
+                if(d.this_month&&d.this_month.dates&&d.this_month.dates.length>0){
                     traces.push({x:d.this_month.dates,y:d.this_month.consumed,name:d.this_month_label+' Consumed',type:'scatter',mode:'lines',line:{color:'#f44336',width:3}});
                     traces.push({x:d.this_month.dates,y:d.this_month.produced,name:d.this_month_label+' Produced',type:'scatter',mode:'lines',line:{color:'#4CAF50',width:3}});
                 }
-                Plotly.newPlot('comparisonChart',traces,{title:'This Month vs Last Month',xaxis:{title:'Date'},yaxis:{title:'Power (W)'},height:450,hovermode:'closest'},{responsive:true});
-            }).catch(e=>console.error(e));
+                if(traces.length===0){
+                    document.getElementById('comparisonChart').innerHTML='<div style="text-align:center;padding:40px;color:#999">No comparison data yet. Data will appear after ESP32 sends readings.</div>';
+                } else {
+                    Plotly.newPlot('comparisonChart',traces,{title:'This Month vs Last Month',xaxis:{title:'Date'},yaxis:{title:'Power (W)'},height:450,hovermode:'closest'},{responsive:true});
+                }
+            }).catch(e=>{console.error('Comparison error:',e);document.getElementById('comparisonChart').innerHTML='<div style="text-align:center;padding:40px;color:#f44336">Error loading comparison data</div>';});
         }
         const d=new Date();document.getElementById('export-start').value=new Date(d-30*86400000).toISOString().slice(0,10);document.getElementById('export-end').value=d.toISOString().slice(0,10);document.getElementById('report-month').value=d.getMonth()+1;
         initChart();fetchData();fetchRealTimePower();loadHistoricalChart();loadComparisonChart();
@@ -904,28 +1095,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# ========== MAIN ==========
-if __name__ == '__main__':
-    print("=" * 70)
-    print("SOLAR MICROGRID ENERGY MANAGEMENT SYSTEM")
-    print("=" * 70)
-    init_db()
-    if not os.path.exists(HISTORICAL_DATA_FILE):
+# ========== INIT (runs on import - works with gunicorn) ==========
+print("=" * 70)
+print("SOLAR MICROGRID ENERGY MANAGEMENT SYSTEM")
+print("=" * 70)
+init_db()
+if not os.path.exists(HISTORICAL_DATA_FILE):
+    init_historical_data()
+else:
+    print("Loading historical data...")
+    try:
+        df = pd.read_csv(HISTORICAL_DATA_FILE)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        for _, row in df.iterrows():
+            historical_power.append({'timestamp': row['timestamp'], 'consumed': row['consumed_power'], 'produced': row['produced_power']})
+        print(f"Loaded {len(historical_power)} records")
+    except Exception as e:
+        print(f"Error: {e}")
         init_historical_data()
-    else:
-        print("Loading historical data...")
-        try:
-            df = pd.read_csv(HISTORICAL_DATA_FILE)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            for _, row in df.iterrows():
-                historical_power.append({'timestamp': row['timestamp'], 'consumed': row['consumed_power'], 'produced': row['produced_power']})
-            print(f"Loaded {len(historical_power)} records")
-        except Exception as e:
-            print(f"Error: {e}")
-            init_historical_data()
-    get_weather_data()
-    threading.Thread(target=update_weather_periodically, daemon=True).start()
-    threading.Thread(target=check_esp32_status, daemon=True).start()
-    time.sleep(2)
-    print("\nSystem Ready! Dashboard: http://localhost:5000")
+get_weather_data()
+threading.Thread(target=update_weather_periodically, daemon=True).start()
+threading.Thread(target=check_esp32_status, daemon=True).start()
+threading.Thread(target=check_battery_email, daemon=True).start()
+print("\nSystem Ready! Dashboard: http://localhost:5000")
+
+if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)

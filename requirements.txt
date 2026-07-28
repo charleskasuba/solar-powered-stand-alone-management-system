@@ -6,3 +6,4 @@ numpy
 gunicorn
 reportlab
 openpyxl
+bird
