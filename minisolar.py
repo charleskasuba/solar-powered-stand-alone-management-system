@@ -317,27 +317,202 @@ def generate_recommendations():
     recommendations = []
     load_power = system_data['load_power']
     battery_soc = system_data['battery_soc']
+    battery_voltage = system_data['battery_voltage']
+    inverter_power = system_data['inverter_power']
+    power_balance = system_data['power_balance']
     current_hour = datetime.now().hour
+
     if not system_data['esp32_online']:
-        recommendations.append("ESP32 is OFFLINE. Check WiFi connection.")
+        recommendations.append({"icon": "\u26a0\ufe0f", "text": "ESP32 is OFFLINE. Check WiFi connection and power supply.", "severity": "critical"})
         return recommendations
-    if battery_soc < 30:
-        recommendations.append(f"Battery LOW ({battery_soc:.0f}%). Consider reducing load.")
+
+    if battery_soc < 15:
+        recommendations.append({"icon": "\ud83d\udea8", "text": f"CRITICAL: Battery at {battery_soc:.0f}%. Reduce all non-essential loads immediately.", "severity": "critical"})
+    elif battery_soc < 30:
+        recommendations.append({"icon": "\u26a0\ufe0f", "text": f"Battery LOW ({battery_soc:.0f}%). Turn off non-essential appliances to conserve power.", "severity": "warning"})
+    elif battery_soc < 50:
+        recommendations.append({"icon": "\ud83d\udca1", "text": f"Battery at {battery_soc:.0f}%. Moderate level \u2014 use energy-efficient appliances.", "severity": "info"})
+    elif battery_soc > 80:
+        recommendations.append({"icon": "\u2705", "text": f"Battery well charged ({battery_soc:.0f}%). Good time to run heavy appliances.", "severity": "good"})
+
+    if inverter_power > 0 and load_power > inverter_power:
+        recommendations.append({"icon": "\u26a0\ufe0f", "text": f"Power deficit! Load ({load_power:.0f}W) exceeds inverter output ({inverter_power:.0f}W). Battery draining.", "severity": "critical"})
+    elif power_balance > 100:
+        recommendations.append({"icon": "\u2705", "text": f"Power surplus of {power_balance:.0f}W. Battery is charging.", "severity": "good"})
+
     if load_power > 700:
-        recommendations.append("High power consumption (>{:.0f}W). Consider turning off non-essential loads.".format(load_power))
+        recommendations.append({"icon": "\ud83d\udca1", "text": f"High consumption ({load_power:.0f}W). Consider turning off non-essential loads.", "severity": "warning"})
     elif load_power > 550:
-        recommendations.append("Moderate power consumption. Monitor during peak hours.")
-    elif load_power < 300:
-        recommendations.append("Low power consumption. Good energy practice!")
-    if battery_soc > 80:
-        recommendations.append("Battery well charged ({:.0f}%). Good for evening peak hours.".format(battery_soc))
-    if 17 <= current_hour <= 21:
-        recommendations.append("Evening peak hour. Run heavy appliances before 5PM or after 9PM.")
+        recommendations.append({"icon": "\ud83d\udca1", "text": f"Moderate consumption ({load_power:.0f}W). Monitor during peak hours.", "severity": "info"})
+    elif 0 < load_power < 100:
+        recommendations.append({"icon": "\u2705", "text": "Low consumption. Excellent energy practice!", "severity": "good"})
+
+    if 6 <= current_hour < 9:
+        recommendations.append({"icon": "\u2600\ufe0f", "text": "Morning hours \u2014 solar panels ramping up. Good time for light appliances."})
     elif 11 <= current_hour <= 14:
-        recommendations.append("Peak solar production time. Good for running high-power devices.")
+        recommendations.append({"icon": "\u2600\ufe0f", "text": "Peak solar production! Run high-power devices now (washing machine, water heater)."})
+    elif 17 <= current_hour <= 21:
+        recommendations.append({"icon": "\ud83c\udf19", "text": "Evening peak \u2014 solar unavailable. Run heavy appliances before 5PM or after 9PM."})
+    elif 22 <= current_hour or current_hour < 5:
+        recommendations.append({"icon": "\ud83d\udca4", "text": "Night mode \u2014 minimal solar. Keep loads low to preserve battery until sunrise."})
+
+    if battery_voltage > 0 and battery_voltage < 11.5:
+        recommendations.append({"icon": "\ud83d\udd0b", "text": f"Battery voltage low ({battery_voltage:.2f}V). Risk of deep discharge damage.", "severity": "critical"})
+
+    if system_data['weather'].get('daily'):
+        today = system_data['weather']['daily'][0]
+        if today.get('temp_max', 0) > 35:
+            recommendations.append({"icon": "\ud83c\udf21\ufe0f", "text": f"Hot weather ({today['temp_max']}°C). Keep batteries ventilated to prevent overheating."})
+        if today.get('uv_index', 0) > 8:
+            recommendations.append({"icon": "\u2600\ufe0f", "text": "High UV index \u2014 excellent solar generation expected today."})
+
     if len(recommendations) < 2:
-        recommendations.append("Schedule heavy appliances during daytime for solar power.")
-    return recommendations[:4]
+        recommendations.append({"icon": "\ud83d\udca1", "text": "System operating normally. Schedule heavy appliances during daytime for solar power."})
+
+    return recommendations[:6]
+
+# ========== AI CHATBOT ==========
+def chatbot_respond(user_message):
+    msg = user_message.lower().strip()
+    sd = system_data
+    now = datetime.now()
+
+    greetings = ['hello', 'hi', 'hey', 'good morning', 'good evening', 'good afternoon', 'howdy', 'greetings']
+    if any(g in msg for g in greetings):
+        return f"Hello! I'm your Solar Microgrid AI assistant at Copperbelt University, Kitwe. I can help you with battery status, energy readings, weather, predictions, and energy-saving tips. What would you like to know?"
+
+    if any(w in msg for w in ['battery', 'soc', 'charge', 'charging']):
+        soc = sd['battery_soc']
+        v = sd['battery_voltage']
+        bp = v * sd['battery_current']
+        status = "fully charged" if soc > 90 else "well charged" if soc > 60 else "moderate" if soc > 30 else "LOW - charge needed"
+        return (f"Battery Status:\n"
+                f"\u2022 State of Charge: {soc:.1f}% ({status})\n"
+                f"\u2022 Voltage: {v:.2f}V\n"
+                f"\u2022 Current: {sd['battery_current']:.2f}A\n"
+                f"\u2022 Power: {bp:.1f}W\n"
+                f"\u2022 Capacity: 70Ah lead-acid\n"
+                f"{'Warning: Battery is low! Reduce non-essential loads.' if soc < 30 else 'Battery is in good condition.'}")
+
+    if any(w in msg for w in ['load', 'consumption', 'power', 'watt', 'how much']):
+        return (f"Current Power Readings:\n"
+                f"\u2022 Load Power (Consumed): {sd['load_power']:.1f}W\n"
+                f"\u2022 Load Current: {sd['load_current']:.2f}A\n"
+                f"\u2022 Load Voltage: {sd['load_voltage']:.1f}V\n"
+                f"\u2022 Inverter Power (Produced): {sd['inverter_power']:.1f}W\n"
+                f"\u2022 Power Balance: {sd['power_balance']:.1f}W\n"
+                f"{'Warning: Consumption exceeds production!' if sd['power_balance'] < 0 else 'System is balanced.'}")
+
+    if any(w in msg for w in ['inverter', 'solar', 'panel', 'production', 'produced']):
+        return (f"Inverter / Solar Output:\n"
+                f"\u2022 Inverter Voltage: {sd['inverter_voltage']:.1f}V\n"
+                f"\u2022 Inverter Current: {sd['inverter_current']:.2f}A\n"
+                f"\u2022 Inverter Power: {sd['inverter_power']:.1f}W\n"
+                f"\u2022 Power Factor: {sd.get('inverter_pf', 0):.2f}\n"
+                f"Energy produced so far: {sd['energy_produced_kwh']:.4f}kWh")
+
+    if any(w in msg for w in ['weather', 'temperature', 'temp', 'forecast', 'sun', 'uv']):
+        w = sd['weather']
+        sl = sd['sunlight']
+        daily = w.get('daily', [])
+        response = f"Current Weather (Kitwe, Zambia):\n"
+        response += f"\u2022 Temperature: {w['current']['temperature']}°C ({w['current']['condition']})\n"
+        response += f"\u2022 UV Index: {sl['uv_index']}\n"
+        response += f"\u2022 Sunrise: {sl['sunrise']} | Sunset: {sl['sunset']}\n"
+        if daily:
+            response += f"\u2022 Today: {daily[0]['temp_min']}°C - {daily[0]['temp_max']}°C\n"
+            response += f"{'High solar production expected today!' if daily[0].get('uv_index', 0) > 6 else 'Moderate solar expected.'}"
+        return response
+
+    if any(w in msg for w in ['predict', 'prediction', 'forecast energy', 'tomorrow', 'weekly', 'today energy']):
+        p = sd['predictions']
+        return (f"Energy Predictions:\n"
+                f"\u2022 Today's predicted: {p.get('today_energy', 0)}kWh\n"
+                f"\u2022 Tomorrow's predicted: {p.get('tomorrow_energy', 0)}kWh\n"
+                f"\u2022 Weekly predicted: {p.get('weekly_energy', 0)}kWh\n"
+                f"\u2022 Peak hours: {', '.join([h['hour'] for h in p.get('peak_hours', [])]) or 'N/A'}\n"
+                f"Tip: Run high-power devices during peak solar hours (11AM-2PM) for best results.")
+
+    if any(w in msg for w in ['relay', 'switch', 'turn on', 'turn off', 'control']):
+        return (f"Relay Status:\n"
+                f"\u2022 Relay 1 (Essential): {sd['load1_state']}\n"
+                f"\u2022 Relay 2 (Priority): {sd['load2_state']}\n"
+                f"To control relays, use the Relay Control buttons on the dashboard.\n"
+                f"Relay 1 powers essential loads (always on preferred).\n"
+                f"Relay 2 powers priority loads (can be switched off to save power).")
+
+    if any(w in msg for w in ['save', 'tip', 'advice', 'reduce', 'efficiency', 'efficient']):
+        tips = [
+            "1. Run heavy appliances (washing machine, water heater) between 11AM-2PM when solar production peaks.",
+            "2. Switch off lights and fans when not in use \u2014 even small loads add up at night.",
+            "3. Use LED bulbs instead of incandescent \u2014 they use 80% less power.",
+            "4. Keep battery charged above 30% to maximize battery lifespan.",
+            "5. Avoid running all appliances simultaneously \u2014 stagger usage to prevent overload.",
+            "6. Monitor the power balance \u2014 if negative, battery is draining. Reduce load.",
+            "7. In hot weather, keep batteries in a ventilated area to prevent thermal damage.",
+        ]
+        return "Energy Saving Tips:\n" + "\n".join(tips)
+
+    if any(w in msg for w in ['status', 'system', 'overview', 'summary', 'how is']):
+        online = "ONLINE" if sd['esp32_online'] else "OFFLINE"
+        return (f"System Overview:\n"
+                f"\u2022 ESP32 Controller: {online}\n"
+                f"\u2022 Battery: {sd['battery_soc']:.1f}% ({sd['battery_voltage']:.2f}V)\n"
+                f"\u2022 Load: {sd['load_power']:.1f}W | Inverter: {sd['inverter_power']:.1f}W\n"
+                f"\u2022 Relay 1: {sd['load1_state']} | Relay 2: {sd['load2_state']}\n"
+                f"\u2022 Power Balance: {sd['power_balance']:.1f}W\n"
+                f"\u2022 Last Update: {sd['timestamp']}\n"
+                f"Everything {'looks good!' if sd['esp32_online'] and sd['battery_soc'] > 30 else 'needs attention.'}")
+
+    if any(w in msg for w in ['cost', 'saving', 'zkw', 'money', 'bill']):
+        energy = sd['energy_produced_kwh']
+        cost = energy * ZMW_PER_KWH
+        co2 = energy * KG_CO2_PER_KWH
+        return (f"Energy Savings (Copperbelt):\n"
+                f"\u2022 Energy Produced: {energy:.4f}kWh\n"
+                f"\u2022 Cost Savings: ZMW {cost:.2f} (@ ZMW {ZMW_PER_KWH}/kWh)\n"
+                f"\u2022 CO2 Offset: {co2:.2f}kg\n"
+                f"Your solar microgrid reduces electricity costs and carbon emissions!")
+
+    if any(w in msg for w in ['help', 'what can you', 'command', 'ask']):
+        return ("I can help with:\n"
+                "\u2022 Battery status \u2014 'What's my battery level?'\n"
+                "\u2022 Power readings \u2014 'How much power am I using?'\n"
+                "\u2022 Solar output \u2014 'What's the solar production?'\n"
+                "\u2022 Weather \u2014 'What's the weather forecast?'\n"
+                "\u2022 Predictions \u2014 'What are the energy predictions?'\n"
+                "\u2022 Relay control \u2014 'What are the relay statuses?'\n"
+                "\u2022 Energy tips \u2014 'Give me energy saving tips'\n"
+                "\u2022 Cost savings \u2014 'How much money am I saving?'\n"
+                "\u2022 System overview \u2014 'Give me a system summary'")
+
+    if any(w in msg for w in ['thank', 'thanks', 'appreciate']):
+        return "You're welcome! I'm here to help you manage your solar microgrid efficiently. Feel free to ask anything!"
+
+    if any(w in msg for w in ['time', 'date', 'when', 'now']):
+        return f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S')} (Africa/Lusaka timezone)"
+
+    return (f"I'm not sure I understand that. You can ask me about:\n"
+            f"\u2022 Battery status and charge level\n"
+            f"\u2022 Power consumption and production\n"
+            f"\u2022 Weather and solar forecast\n"
+            f"\u2022 Energy predictions\n"
+            f"\u2022 Relay control status\n"
+            f"\u2022 Energy saving tips\n"
+            f"\u2022 Cost savings\n\n"
+            f"Type 'help' for a full list of commands.")
+
+@app.route('/api/chat', methods=['POST'])
+def chat_endpoint():
+    try:
+        data = request.get_json(force=True)
+        user_msg = data.get('message', '').strip()
+        if not user_msg:
+            return jsonify({'error': 'Empty message'}), 400
+        response = chatbot_respond(user_msg)
+        return jsonify({'response': response, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+    except Exception as e:
+        return jsonify({'response': f'Error: {str(e)}'}), 500
 
 # ========== WEATHER DATA ==========
 def get_weather_data():
@@ -848,6 +1023,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .email-btn{background:#9c27b0;color:white;padding:10px 20px;border:none;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;margin:5px;transition:all .2s}
         .email-btn:hover{background:#7b1fa2}
         .email-btn:disabled{background:#ccc;cursor:not-allowed}
+        .chat-card{position:relative}
+        .chat-messages{height:350px;overflow-y:auto;padding:10px;background:#f5f5f5;border-radius:12px;margin-bottom:10px;scroll-behavior:smooth}
+        .chat-msg{margin:8px 0;display:flex;gap:8px}
+        .chat-msg.user{justify-content:flex-end}
+        .chat-bubble{max-width:80%;padding:10px 14px;border-radius:16px;font-size:13px;line-height:1.5;white-space:pre-line;word-wrap:break-word}
+        .chat-bubble.bot{background:#1a1a2e;color:white;border-bottom-left-radius:4px}
+        .chat-bubble.user{background:#2196F3;color:white;border-bottom-right-radius:4px}
+        .chat-avatar{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
+        .chat-avatar.bot-avatar{background:#1a1a2e;color:white}
+        .chat-avatar.user-avatar{background:#2196F3;color:white}
+        .chat-input-row{display:flex;gap:8px}
+        .chat-input{flex:1;padding:10px 14px;border:2px solid #ddd;border-radius:25px;font-size:14px;outline:none;transition:border .2s}
+        .chat-input:focus{border-color:#2196F3}
+        .chat-send{width:42px;height:42px;border-radius:50%;border:none;background:#2196F3;color:white;font-size:18px;cursor:pointer;transition:background .2s;display:flex;align-items:center;justify-content:center}
+        .chat-send:hover{background:#1976D2}
+        .chat-send:disabled{background:#ccc;cursor:not-allowed}
+        .chat-suggestions{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}
+        .chat-suggest{padding:4px 10px;border:1px solid #ddd;border-radius:15px;font-size:11px;cursor:pointer;background:white;transition:all .2s;color:#333}
+        .chat-suggest:hover{background:#2196F3;color:white;border-color:#2196F3}
+        .rec-icon{margin-right:8px;font-size:16px}
+        .rec-critical{background:#fff3f3;border-left-color:#f44336}
+        .rec-warning{background:#fff8e1;border-left-color:#ff9800}
+        .rec-good{background:#f1f8e9;border-left-color:#4CAF50}
+        .rec-info{background:#e3f2fd;border-left-color:#2196F3}
     </style>
 </head>
 <body>
@@ -971,6 +1170,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div id="weather-info"></div>
                 <div id="sunlight-info"></div>
             </div>
+            <div class="card chat-card">
+                <div class="card-header">Solar AI Assistant</div>
+                <div class="chat-messages" id="chat-messages">
+                    <div class="chat-msg">
+                        <div class="chat-avatar bot-avatar">AI</div>
+                        <div class="chat-bubble bot">Hello! I'm your Solar Microgrid AI assistant. Ask me about battery status, power readings, weather, energy tips, or system status.</div>
+                    </div>
+                </div>
+                <div class="chat-suggestions" id="chat-suggestions">
+                    <span class="chat-suggest" onclick="sendChat('battery status')">Battery Status</span>
+                    <span class="chat-suggest" onclick="sendChat('power readings')">Power Readings</span>
+                    <span class="chat-suggest" onclick="sendChat('weather forecast')">Weather</span>
+                    <span class="chat-suggest" onclick="sendChat('energy tips')">Energy Tips</span>
+                    <span class="chat-suggest" onclick="sendChat('system overview')">System Overview</span>
+                    <span class="chat-suggest" onclick="sendChat('help')">Help</span>
+                </div>
+                <div class="chat-input-row">
+                    <input type="text" class="chat-input" id="chat-input" placeholder="Ask about your solar system..." onkeydown="if(event.key==='Enter')sendChat()">
+                    <button class="chat-send" id="chat-send-btn" onclick="sendChat()">&#10148;</button>
+                </div>
+            </div>
         </div>
 
         <div id="timestamp" class="timestamp">Last Update: --</div>
@@ -1050,7 +1270,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     const p=document.getElementById('peak-hours');
                     if(p&&d.predictions.peak_hours)p.innerHTML=d.predictions.peak_hours.map(x=>'<div class="peak-hour">'+x.hour+' ('+x.factor+'x)</div>').join('');
                 }
-                if(d.recommendations)document.getElementById('recommendations').innerHTML=d.recommendations.map(r=>'<div class="recommendation">'+r+'</div>').join('');
+                if(d.recommendations){
+                    document.getElementById('recommendations').innerHTML=d.recommendations.map(r=>{
+                        if(typeof r==='object'){
+                            const sev=r.severity?'rec-'+r.severity:'';
+                            return '<div class="recommendation '+sev+'"><span class="rec-icon">'+r.icon+'</span>'+r.text+'</div>';
+                        }
+                        return '<div class="recommendation">'+r+'</div>';
+                    }).join('');
+                }
                 if(d.weather&&d.weather.daily&&d.weather.daily.length>0){const w=d.weather.daily[0];document.getElementById('weather-info').innerHTML='<div>Temp: '+w.temp_max+'C/'+w.temp_min+'C</div><div>Condition: '+d.weather.current.condition+'</div>';}
                 if(d.sunlight)document.getElementById('sunlight-info').innerHTML='<div>Sunrise: '+d.sunlight.sunrise+'</div><div>Sunset: '+d.sunlight.sunset+'</div><div>UV: '+d.sunlight.uv_index+'</div>';
                 document.getElementById('timestamp').innerHTML='Last Update: '+d.timestamp;
@@ -1095,6 +1323,33 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     Plotly.newPlot('comparisonChart',traces,{title:'This Month vs Last Month',xaxis:{title:'Date'},yaxis:{title:'Power (W)'},height:450,hovermode:'closest'},{responsive:true});
                 }
             }).catch(e=>{console.error('Comparison error:',e);document.getElementById('comparisonChart').innerHTML='<div style="text-align:center;padding:40px;color:#f44336">Error loading comparison data</div>';});
+        }
+        function sendChat(msg){
+            const input=document.getElementById('chat-input');
+            const messages=document.getElementById('chat-messages');
+            const text=msg||input.value.trim();
+            if(!text)return;
+            input.value='';
+            messages.innerHTML+='<div class="chat-msg user"><div class="chat-avatar user-avatar">U</div><div class="chat-bubble user">'+text.replace(/</g,'&lt;')+'</div></div>';
+            messages.scrollTop=messages.scrollHeight;
+            const sendBtn=document.getElementById('chat-send-btn');
+            sendBtn.disabled=true;
+            messages.innerHTML+='<div class="chat-msg" id="chat-typing"><div class="chat-avatar bot-avatar">AI</div><div class="chat-bubble bot" style="opacity:.6">Thinking...</div></div>';
+            messages.scrollTop=messages.scrollHeight;
+            fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})})
+            .then(r=>r.json()).then(d=>{
+                const typing=document.getElementById('chat-typing');
+                if(typing)typing.remove();
+                messages.innerHTML+='<div class="chat-msg"><div class="chat-avatar bot-avatar">AI</div><div class="chat-bubble bot">'+d.response.replace(/\\n/g,'<br>').replace(/</g,'&lt;').replace(/&lt;br>/g,'<br>')+'</div></div>';
+                messages.scrollTop=messages.scrollHeight;
+                sendBtn.disabled=false;
+            }).catch(e=>{
+                const typing=document.getElementById('chat-typing');
+                if(typing)typing.remove();
+                messages.innerHTML+='<div class="chat-msg"><div class="chat-avatar bot-avatar">AI</div><div class="chat-bubble bot" style="background:#f44336">Error: Could not reach AI assistant.</div></div>';
+                messages.scrollTop=messages.scrollHeight;
+                sendBtn.disabled=false;
+            });
         }
         const d=new Date();document.getElementById('export-start').value=new Date(d-30*86400000).toISOString().slice(0,10);document.getElementById('export-end').value=d.toISOString().slice(0,10);document.getElementById('report-month').value=d.getMonth()+1;
         initChart();fetchData();fetchRealTimePower();loadHistoricalChart();loadComparisonChart();
