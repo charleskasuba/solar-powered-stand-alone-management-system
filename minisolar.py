@@ -40,7 +40,7 @@ EMAIL_TO = "mwansakapikila48@gmail.com"
 
 # ========== GLOBAL DATA STORAGE ==========
 system_data = {
-    'battery_voltage': 0, 'battery_current': 0, 'battery_soc': 0,
+    'battery_voltage': 0, 'battery_current': 0, 'battery_power': 0, 'battery_soc': 0,
     'inverter_voltage': 0, 'inverter_current': 0, 'inverter_power': 0,
     'load_voltage': 0, 'load_current': 0, 'load_power': 0,
     'energy_consumed_kwh': 0, 'energy_produced_kwh': 0,
@@ -625,6 +625,7 @@ def update_from_esp32():
         system_data['energy_consumed_kwh'] = float(args.get('le', 0))
         system_data['battery_voltage'] = float(args.get('bv', 0))
         system_data['battery_current'] = float(args.get('bc', 0))
+        system_data['battery_power'] = float(args.get('bp', 0))
         system_data['battery_soc'] = float(args.get('bs', 0))
         system_data['load1_state'] = args.get('r1', 'OFF')
         system_data['load2_state'] = args.get('r2', 'OFF')
@@ -695,11 +696,15 @@ def get_commands():
 
 @app.route('/api/relay', methods=['GET', 'POST'])
 def control_relay():
-    data = request.get_json(force=True)
-    if not data:
-        return jsonify({'error': 'No data'}), 400
-    relay = data.get('relay')
-    state = data.get('state', 'ON')
+    if request.method == 'GET':
+        relay = request.args.get('relay', type=int)
+        state = request.args.get('state', 'OFF')
+    else:
+        data = request.get_json(force=True)
+        if not data:
+            return jsonify({'error': 'No data'}), 400
+        relay = data.get('relay')
+        state = data.get('state', 'ON')
     if relay not in [1, 2]:
         return jsonify({'error': 'Invalid relay'}), 400
     if state not in ['ON', 'OFF']:
