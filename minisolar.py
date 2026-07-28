@@ -141,8 +141,48 @@ def notify_esp32_online():
     """
     send_email("Solar Microgrid: ESP32 Back Online", html)
 
+def notify_inverter_zero():
+    html = """
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
+        <div style="background:#f44336;color:white;padding:15px;border-radius:8px;text-align:center">
+            <h2>Solar Microgrid Alert</h2>
+        </div>
+        <div style="padding:20px;background:#fff3f3;border:1px solid #f44336;border-radius:0 0 8px 8px">
+            <h3 style="color:#f44336">Inverter Output is ZERO</h3>
+            <p>The inverter is reporting no power output while the system is online.</p>
+            <p><strong>Inverter Power:</strong> """ + f"{system_data['inverter_power']:.1f}W" + """</p>
+            <p><strong>Inverter Voltage:</strong> """ + f"{system_data['inverter_voltage']:.1f}V" + """</p>
+            <p><strong>Battery SOC:</strong> """ + f"{system_data['battery_soc']:.1f}%" + """</p>
+            <p><strong>Load Power:</strong> """ + f"{system_data['load_power']:.1f}W" + """</p>
+            <p><strong>Possible Causes:</strong> Inverter fault, PV panels not producing, or inverter breaker tripped.</p>
+            <p><strong>Time:</strong> """ + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + """</p>
+            <hr>
+            <p style="color:#666;font-size:12px">Copperbelt University Solar Microgrid System</p>
+        </div>
+    </div>
+    """
+    send_email("Solar Microgrid Alert: Inverter Output Zero", html)
+
+def notify_inverter_restored():
+    html = """
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
+        <div style="background:#4CAF50;color:white;padding:15px;border-radius:8px;text-align:center">
+            <h2>Solar Microgrid Status</h2>
+        </div>
+        <div style="padding:20px;background:#f1f8e9;border:1px solid #4CAF50;border-radius:0 0 8px 8px">
+            <h3 style="color:#4CAF50">Inverter Output Restored</h3>
+            <p>The inverter has resumed normal operation.</p>
+            <p><strong>Inverter Power:</strong> """ + f"{system_data['inverter_power']:.1f}W" + """</p>
+            <p><strong>Time:</strong> """ + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + """</p>
+            <hr>
+            <p style="color:#666;font-size:12px">Copperbelt University Solar Microgrid System</p>
+        </div>
+    </div>
+    """
+    send_email("Solar Microgrid: Inverter Output Restored", html)
+
 # Track email notification state to avoid spam
-email_alert_state = {'esp32_was_online': False, 'low_battery_sent': False}
+email_alert_state = {'esp32_was_online': False, 'low_battery_sent': False, 'inverter_zero_sent': False, 'inverter_zero_streak': 0}
 
 # ========== DATABASE ==========
 def get_db():
@@ -592,11 +632,28 @@ def check_battery_email():
         time.sleep(60)
         try:
             soc = system_data['battery_soc']
-            if system_data['esp32_online'] and soc > 0 and soc < 20 and not email_alert_state['low_battery_sent']:
+            ip = system_data['inverter_power']
+            online = system_data['esp32_online']
+            hour = datetime.now().hour
+
+            if online and soc > 0 and soc < 20 and not email_alert_state['low_battery_sent']:
                 notify_low_battery(soc)
                 email_alert_state['low_battery_sent'] = True
             elif soc >= 25:
                 email_alert_state['low_battery_sent'] = False
+
+            if online and ip == 0 and 6 <= hour <= 18:
+                email_alert_state['inverter_zero_streak'] += 1
+                if email_alert_state['inverter_zero_streak'] >= 2 and not email_alert_state['inverter_zero_sent']:
+                    notify_inverter_zero()
+                    email_alert_state['inverter_zero_sent'] = True
+            elif online and ip > 0:
+                if email_alert_state['inverter_zero_sent']:
+                    notify_inverter_restored()
+                email_alert_state['inverter_zero_sent'] = False
+                email_alert_state['inverter_zero_streak'] = 0
+            elif not online:
+                pass
         except Exception as e:
             print(f"Battery email check error: {e}")
 
