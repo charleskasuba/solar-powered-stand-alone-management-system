@@ -502,11 +502,14 @@ def chatbot_respond(user_message):
             f"\u2022 Cost savings\n\n"
             f"Type 'help' for a full list of commands.")
 
-@app.route('/api/chat', methods=['POST'])
+@app.route('/api/chat', methods=['GET', 'POST'])
 def chat_endpoint():
     try:
-        data = request.get_json(force=True)
-        user_msg = data.get('message', '').strip()
+        if request.method == 'POST':
+            data = request.get_json(force=True)
+            user_msg = data.get('message', '').strip()
+        else:
+            user_msg = request.args.get('message', '').strip()
         if not user_msg:
             return jsonify({'error': 'Empty message'}), 400
         response = chatbot_respond(user_msg)
@@ -690,7 +693,7 @@ def get_commands():
             return jsonify(cmd)
         return jsonify({'cmd': 'none'})
 
-@app.route('/api/relay', methods=['POST'])
+@app.route('/api/relay', methods=['GET', 'POST'])
 def control_relay():
     data = request.get_json(force=True)
     if not data:
@@ -958,7 +961,7 @@ def download_csv():
         return send_file(HISTORICAL_DATA_FILE, as_attachment=True)
     return "No data available", 404
 
-@app.route('/api/test_email', methods=['POST'])
+@app.route('/api/test_email', methods=['GET', 'POST'])
 def test_email():
     try:
         result = send_email("Solar Microgrid: Test Email",
@@ -1207,7 +1210,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             ]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top'},title:{display:true,text:'Last 60 Seconds'}},scales:{y:{beginAtZero:true,title:{display:true,text:'Watts'}},x:{title:{display:true,text:'Time'}}}}});
         }
         function sendRelayCmd(r,s){
-            fetch('/api/relay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:r,state:s})})
+            fetch('/api/relay?relay='+r+'&state='+s)
             .then(r=>r.json()).then(d=>{
                 console.log(d);
                 alert('Relay '+r+' -> '+s+': '+d.status);
@@ -1217,7 +1220,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const btn=document.getElementById('email-test-btn');
             const status=document.getElementById('email-status');
             btn.disabled=true;btn.textContent='Sending...';
-            fetch('/api/test_email',{method:'POST'}).then(r=>r.json()).then(d=>{
+            fetch('/api/test_email').then(r=>r.json()).then(d=>{
                 btn.disabled=false;btn.textContent='Send Test Email';
                 status.innerHTML=d.status==='ok'?'<span style="color:#4CAF50">Email sent successfully!</span>':'<span style="color:#f44336">'+d.message+'</span>';
             }).catch(e=>{
@@ -1336,7 +1339,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             sendBtn.disabled=true;
             messages.innerHTML+='<div class="chat-msg" id="chat-typing"><div class="chat-avatar bot-avatar">AI</div><div class="chat-bubble bot" style="opacity:.6">Thinking...</div></div>';
             messages.scrollTop=messages.scrollHeight;
-            fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})})
+            fetch('/api/chat?message='+encodeURIComponent(text))
             .then(r=>r.json()).then(d=>{
                 const typing=document.getElementById('chat-typing');
                 if(typing)typing.remove();
